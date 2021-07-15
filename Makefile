@@ -1,9 +1,25 @@
 VERSION       := $(shell git describe --tags --always --dirty="-dev" --match "[0-9][0-9][0-9][0-9].*.*")
-DATE          := $(shell date -u '+%Y-%m-%d-%H%M UTC')
-VERSION_FLAGS := -ldflags='-X "main.Version=$(VERSION)" -X "main.BuildTime=$(DATE)"'
 MSI_VERSION   := $(shell git tag -l --sort=v:refname | grep "w" | tail -1 | cut -c2-)
 #MSI_VERSION expects the format of the tag to be: (wX.X.X). Starts with the w character to not break cfsetup.
 #e.g. w3.0.1 or w4.2.10. It trims off the w character when creating the MSI.
+
+ifeq ($(FIPS), true)
+	GO_BUILD_TAGS := $(GO_BUILD_TAGS) fips
+endif
+
+ifneq ($(GO_BUILD_TAGS),)
+	GO_BUILD_TAGS := -tags $(GO_BUILD_TAGS)
+endif
+
+ifeq ($(NIGHTLY), true)
+	DEB_PACKAGE_NAME := cloudflared-nightly
+	NIGHTLY_FLAGS := --conflicts cloudflared --replaces cloudflared
+else
+	DEB_PACKAGE_NAME := cloudflared
+endif
+
+DATE          := $(shell date -u '+%Y-%m-%d-%H%M UTC')
+VERSION_FLAGS := -ldflags='-X "main.Version=$(VERSION)" -X "main.BuildTime=$(DATE)"'
 
 IMPORT_PATH   := github.com/cloudflare/cloudflared
 PACKAGE_DIR   := $(CURDIR)/packaging
@@ -24,6 +40,8 @@ LOCAL_ARCH ?= $(shell uname -m)
 ifneq ($(GOARCH),)
     TARGET_ARCH ?= $(GOARCH)
 else ifeq ($(LOCAL_ARCH),x86_64)
+    TARGET_ARCH ?= amd64
+else ifeq ($(LOCAL_ARCH),amd64)
     TARGET_ARCH ?= amd64
 else ifeq ($(LOCAL_ARCH),i686)
     TARGET_ARCH ?= amd64
@@ -71,7 +89,17 @@ clean:
 
 .PHONY: cloudflared
 cloudflared: tunnel-deps
-	GOOS=$(TARGET_OS) GOARCH=$(TARGET_ARCH) go build -v -mod=vendor $(VERSION_FLAGS) $(IMPORT_PATH)/cmd/cloudflared
+ifeq ($(FIPS), true)
+	$(info Building cloudflared with go-fips)
+	-test -f fips/fips.go && mv fips/fips.go fips/fips.go.linux-amd64
+	mv fips/fips.go.linux-amd64 fips/fips.go
+endif
+
+	GOOS=$(TARGET_OS) GOARCH=$(TARGET_ARCH) go build -v -mod=vendor $(GO_BUILD_TAGS) $(VERSION_FLAGS) $(IMPORT_PATH)/cmd/cloudflared
+
+ifeq ($(FIPS), true)
+	mv fips/fips.go fips/fips.go.linux-amd64
+endif
 
 .PHONY: container
 container:
@@ -79,17 +107,23 @@ container:
 
 .PHONY: test
 test: vet
+ifndef CI
 	go test -v -mod=vendor -race $(VERSION_FLAGS) ./...
+else
+	@mkdir -p .cover
+	go test -v -mod=vendor -race $(VERSION_FLAGS) -coverprofile=".cover/c.out" ./...
+	go tool cover -html ".cover/c.out" -o .cover/all.html
+endif
 
 .PHONY: test-ssh-server
 test-ssh-server:
 	docker-compose -f ssh_server_tests/docker-compose.yml up
 
 define publish_package
+	chmod 664 cloudflared*.$(1); \
 	for HOST in $(CF_PKG_HOSTS); do \
 		ssh-keyscan -t rsa $$HOST >> ~/.ssh/known_hosts; \
-		scp -4 cloudflared*.$(1) cfsync@$$HOST:/state/cf-pkg/staging/$(2)/$(TARGET_PUBLIC_REPO)/cloudflared/; \
-		ssh cfsync@$$HOST 'chmod g+w /state/cf-pkg/staging/$(2)/$(TARGET_PUBLIC_REPO)/cloudflared/*.$(1)'; \
+		scp -p -4 cloudflared*.$(1) cfsync@$$HOST:/state/cf-pkg/staging/$(2)/$(TARGET_PUBLIC_REPO)/cloudflared/; \
 	done
 endef
 
@@ -111,7 +145,7 @@ define build_package
 		--license 'Cloudflare Service Agreement' \
 		--url 'https://github.com/cloudflare/cloudflared' \
 		-m 'Cloudflare <support@cloudflare.com>' \
-		-a $(TARGET_ARCH) -v $(VERSION) -n cloudflared --after-install postinst.sh --after-remove postrm.sh \
+		-a $(TARGET_ARCH) -v $(VERSION) -n $(DEB_PACKAGE_NAME) $(NIGHTLY_FLAGS) --after-install postinst.sh --after-remove postrm.sh \
 		cloudflared=$(INSTALL_BINDIR) cloudflared.1=$(MAN_DIR)
 endef
 
@@ -218,12 +252,22 @@ tunnelrpc/tunnelrpc.capnp.go: tunnelrpc/tunnelrpc.capnp
 	which capnpc-go  # go get zombiezen.com/go/capnproto2/capnpc-go
 	capnp compile -ogo tunnelrpc/tunnelrpc.capnp
 
+.PHONY: quic-deps
+quic-deps: 
+	which capnp 
+	which capnpc-go
+	capnp compile -ogo quic/schema/quic_metadata_protocol.capnp
+
 .PHONY: vet
 vet:
 	go vet -mod=vendor ./...
-	which go-sumtype  # go get github.com/BurntSushi/go-sumtype
+	which go-sumtype  # go get github.com/BurntSushi/go-sumtype (don't do this in build directory or this will cause vendor issues)
 	go-sumtype $$(go list -mod=vendor ./...)
 
 .PHONY: msi
 msi: cloudflared
 	go-msi make --msi cloudflared.msi --version $(MSI_VERSION)
+
+.PHONY: goimports
+goimports:
+	for d in $$(go list -mod=readonly -f '{{.Dir}}' -a ./... | fgrep -v tunnelrpc) ; do goimports -format-only -local github.com/cloudflare/cloudflared -w $$d ; done

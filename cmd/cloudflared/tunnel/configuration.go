@@ -8,8 +8,15 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/google/uuid"
+	homedir "github.com/mitchellh/go-homedir"
+	"github.com/pkg/errors"
+	"github.com/rs/zerolog"
+	"github.com/urfave/cli/v2"
+	"golang.org/x/crypto/ssh/terminal"
+
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/buildinfo"
-	"github.com/cloudflare/cloudflared/cmd/cloudflared/config"
+	"github.com/cloudflare/cloudflared/config"
 	"github.com/cloudflare/cloudflared/connection"
 	"github.com/cloudflare/cloudflared/edgediscovery"
 	"github.com/cloudflare/cloudflared/h2mux"
@@ -18,13 +25,6 @@ import (
 	"github.com/cloudflare/cloudflared/tlsconfig"
 	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
 	"github.com/cloudflare/cloudflared/validation"
-
-	"github.com/google/uuid"
-	"github.com/mitchellh/go-homedir"
-	"github.com/pkg/errors"
-	"github.com/rs/zerolog"
-	"github.com/urfave/cli/v2"
-	"golang.org/x/crypto/ssh/terminal"
 )
 
 const LogFieldOriginCertPath = "originCertPath"
@@ -85,8 +85,8 @@ func logClientOptions(c *cli.Context, log *zerolog.Logger) {
 	}
 }
 
-func dnsProxyStandAlone(c *cli.Context) bool {
-	return c.IsSet("proxy-dns") && (!c.IsSet("hostname") && !c.IsSet("tag") && !c.IsSet("hello-world"))
+func dnsProxyStandAlone(c *cli.Context, namedTunnel *connection.NamedTunnelConfig) bool {
+	return c.IsSet("proxy-dns") && (!c.IsSet("hostname") && !c.IsSet("tag") && !c.IsSet("hello-world") && namedTunnel == nil)
 }
 
 func findOriginCert(originCertPath string, log *zerolog.Logger) (string, error) {
@@ -109,7 +109,7 @@ func findOriginCert(originCertPath string, log *zerolog.Logger) (string, error) 
 	// Check that the user has acquired a certificate using the login command
 	ok, err := config.FileExists(originCertPath)
 	if err != nil {
-		log.Error().Msgf("Cannot check if origin cert exists at path %s", originCertPath)
+		log.Error().Err(err).Msgf("Cannot check if origin cert exists at path %s", originCertPath)
 		return "", fmt.Errorf("cannot check if origin cert exists at path %s", originCertPath)
 	}
 	if !ok {
@@ -149,7 +149,7 @@ func prepareTunnelConfig(
 	c *cli.Context,
 	buildInfo *buildinfo.BuildInfo,
 	version string,
-	log *zerolog.Logger,
+	log, logTransport *zerolog.Logger,
 	observer *connection.Observer,
 	namedTunnel *connection.NamedTunnelConfig,
 ) (*origin.TunnelConfig, ingress.Ingress, error) {
@@ -195,18 +195,21 @@ func prepareTunnelConfig(
 		ingressRules  ingress.Ingress
 		classicTunnel *connection.ClassicTunnelConfig
 	)
+	cfg := config.GetConfiguration()
 	if isNamedTunnel {
 		clientUUID, err := uuid.NewRandom()
 		if err != nil {
-			return nil, ingress.Ingress{}, errors.Wrap(err, "can't generate clientUUID")
+			return nil, ingress.Ingress{}, errors.Wrap(err, "can't generate connector UUID")
 		}
+		log.Info().Msgf("Generated Connector ID: %s", clientUUID)
+		features := append(c.StringSlice("features"), origin.FeatureSerializedHeaders)
 		namedTunnel.Client = tunnelpogs.ClientInfo{
 			ClientID: clientUUID[:],
-			Features: []string{origin.FeatureSerializedHeaders},
+			Features: dedup(features),
 			Version:  version,
-			Arch:     fmt.Sprintf("%s_%s", buildInfo.GoOS, buildInfo.GoArch),
+			Arch:     buildInfo.OSArch(),
 		}
-		ingressRules, err = ingress.ParseIngress(config.GetConfiguration())
+		ingressRules, err = ingress.ParseIngress(cfg)
 		if err != nil && err != ingress.ErrNoIngressRules {
 			return nil, ingress.Ingress{}, err
 		}
@@ -230,7 +233,14 @@ func prepareTunnelConfig(
 		}
 	}
 
-	protocolSelector, err := connection.NewProtocolSelector(c.String("protocol"), namedTunnel, edgediscovery.HTTP2Percentage, origin.ResolveTTL, log)
+	var warpRoutingService *ingress.WarpRoutingService
+	warpRoutingEnabled := isWarpRoutingEnabled(cfg.WarpRouting, isNamedTunnel)
+	if warpRoutingEnabled {
+		warpRoutingService = ingress.NewWarpRoutingService()
+		log.Info().Msgf("Warp-routing is enabled")
+	}
+
+	protocolSelector, err := connection.NewProtocolSelector(c.String("protocol"), warpRoutingEnabled, namedTunnel, edgediscovery.HTTP2Percentage, origin.ResolveTTL, log)
 	if err != nil {
 		return nil, ingress.Ingress{}, err
 	}
@@ -245,16 +255,16 @@ func prepareTunnelConfig(
 		edgeTLSConfigs[p] = edgeTLSConfig
 	}
 
-	originClient := origin.NewClient(ingressRules, tags, log)
+	originProxy := origin.NewOriginProxy(ingressRules, warpRoutingService, tags, log)
 	connectionConfig := &connection.Config{
-		OriginClient:    originClient,
+		OriginProxy:     originProxy,
 		GracePeriod:     c.Duration("grace-period"),
 		ReplaceExisting: c.Bool("force"),
 	}
 	muxerConfig := &connection.MuxerConfig{
-		HeartbeatInterval:  c.Duration("heartbeat-interval"),
+		HeartbeatInterval: c.Duration("heartbeat-interval"),
 		// Note TUN-3758 , we use Int because UInt is not supported with altsrc
-		MaxHeartbeats:      uint64(c.Int("heartbeat-count")),
+		MaxHeartbeats: uint64(c.Int("heartbeat-count")),
 		// Note TUN-3758 , we use Int because UInt is not supported with altsrc
 		CompressionSetting: h2mux.CompressionSetting(uint64(c.Int("compression-quality"))),
 		MetricsUpdateFreq:  c.Duration("metrics-update-freq"),
@@ -262,7 +272,7 @@ func prepareTunnelConfig(
 
 	return &origin.TunnelConfig{
 		ConnectionConfig: connectionConfig,
-		BuildInfo:        buildInfo,
+		OSArch:           buildInfo.OSArch(),
 		ClientID:         clientID,
 		EdgeAddrs:        c.StringSlice("edge"),
 		HAConnections:    c.Int("ha-connections"),
@@ -272,6 +282,7 @@ func prepareTunnelConfig(
 		LBPool:           c.String("lb-pool"),
 		Tags:             tags,
 		Log:              log,
+		LogTransport:     logTransport,
 		Observer:         observer,
 		ReportedVersion:  version,
 		// Note TUN-3758 , we use Int because UInt is not supported with altsrc
@@ -285,6 +296,29 @@ func prepareTunnelConfig(
 	}, ingressRules, nil
 }
 
+func isWarpRoutingEnabled(warpConfig config.WarpRoutingConfig, isNamedTunnel bool) bool {
+	return warpConfig.Enabled && isNamedTunnel
+}
+
 func isRunningFromTerminal() bool {
 	return terminal.IsTerminal(int(os.Stdout.Fd()))
+}
+
+// Remove any duplicates from the slice
+func dedup(slice []string) []string {
+
+	// Convert the slice into a set
+	set := make(map[string]bool, 0)
+	for _, str := range slice {
+		set[str] = true
+	}
+
+	// Convert the set back into a slice
+	keys := make([]string, len(set))
+	i := 0
+	for str := range set {
+		keys[i] = str
+		i++
+	}
+	return keys
 }

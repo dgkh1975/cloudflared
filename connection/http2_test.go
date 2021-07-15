@@ -12,15 +12,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gobwas/ws/wsutil"
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/net/http2"
 
 	"github.com/cloudflare/cloudflared/tunnelrpc/pogs"
 	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
-
-	"github.com/gobwas/ws/wsutil"
-	"github.com/rs/zerolog"
-	"github.com/stretchr/testify/require"
-	"golang.org/x/net/http2"
 )
 
 var (
@@ -35,7 +34,7 @@ func newTestHTTP2Connection() (*http2Connection, net.Conn) {
 		testConfig,
 		&NamedTunnelConfig{},
 		&pogs.ConnectionOptions{},
-		testObserver,
+		NewObserver(&log, &log, false),
 		connIndex,
 		mockConnectedFuse{},
 		nil,
@@ -104,9 +103,9 @@ func TestServeHTTP(t *testing.T) {
 			require.Equal(t, test.expectedBody, respBody)
 		}
 		if test.isProxyError {
-			require.Equal(t, responseMetaHeaderCfd, resp.Header.Get(ResponseMetaHeaderField))
+			require.Equal(t, responseMetaHeaderCfd, resp.Header.Get(ResponseMetaHeader))
 		} else {
-			require.Equal(t, responseMetaHeaderOrigin, resp.Header.Get(ResponseMetaHeaderField))
+			require.Equal(t, responseMetaHeaderOrigin, resp.Header.Get(ResponseMetaHeader))
 		}
 	}
 	cancel()
@@ -114,6 +113,7 @@ func TestServeHTTP(t *testing.T) {
 }
 
 type mockNamedTunnelRPCClient struct {
+	shouldFail   error
 	registered   chan struct{}
 	unregistered chan struct{}
 }
@@ -125,6 +125,9 @@ func (mc mockNamedTunnelRPCClient) RegisterConnection(
 	connIndex uint8,
 	observer *Observer,
 ) error {
+	if mc.shouldFail != nil {
+		return mc.shouldFail
+	}
 	close(mc.registered)
 	return nil
 }
@@ -136,12 +139,14 @@ func (mc mockNamedTunnelRPCClient) GracefulShutdown(ctx context.Context, gracePe
 func (mockNamedTunnelRPCClient) Close() {}
 
 type mockRPCClientFactory struct {
+	shouldFail   error
 	registered   chan struct{}
 	unregistered chan struct{}
 }
 
 func (mf *mockRPCClientFactory) newMockRPCClient(context.Context, io.ReadWriteCloser, *zerolog.Logger) NamedTunnelRPCClient {
 	return mockNamedTunnelRPCClient{
+		shouldFail:   mf.shouldFail,
 		registered:   mf.registered,
 		unregistered: mf.unregistered,
 	}
@@ -186,7 +191,7 @@ func TestServeWS(t *testing.T) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost:8080/ws", readPipe)
 	require.NoError(t, err)
-	req.Header.Set(internalUpgradeHeader, websocketUpgrade)
+	req.Header.Set(InternalUpgradeHeader, WebsocketUpgrade)
 
 	wg.Add(1)
 	go func() {
@@ -206,7 +211,7 @@ func TestServeWS(t *testing.T) {
 	resp := respWriter.Result()
 	// http2RespWriter should rewrite status 101 to 200
 	require.Equal(t, http.StatusOK, resp.StatusCode)
-	require.Equal(t, responseMetaHeaderOrigin, resp.Header.Get(ResponseMetaHeaderField))
+	require.Equal(t, responseMetaHeaderOrigin, resp.Header.Get(ResponseMetaHeader))
 
 	wg.Wait()
 }
@@ -230,7 +235,7 @@ func TestServeControlStream(t *testing.T) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost:8080/", nil)
 	require.NoError(t, err)
-	req.Header.Set(internalUpgradeHeader, controlStreamUpgrade)
+	req.Header.Set(InternalUpgradeHeader, ControlStreamUpgrade)
 
 	edgeHTTP2Conn, err := testTransport.NewClientConn(edgeConn)
 	require.NoError(t, err)
@@ -249,15 +254,15 @@ func TestServeControlStream(t *testing.T) {
 	wg.Wait()
 }
 
-func TestGracefulShutdownHTTP2(t *testing.T) {
+func TestFailRegistration(t *testing.T) {
 	http2Conn, edgeConn := newTestHTTP2Connection()
 
 	rpcClientFactory := mockRPCClientFactory{
+		shouldFail:   errDuplicationConnection,
 		registered:   make(chan struct{}),
 		unregistered: make(chan struct{}),
 	}
 	http2Conn.newRPCClientFunc = rpcClientFactory.newMockRPCClient
-	http2Conn.gracefulShutdownC = make(chan struct{})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
@@ -269,7 +274,43 @@ func TestGracefulShutdownHTTP2(t *testing.T) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost:8080/", nil)
 	require.NoError(t, err)
-	req.Header.Set(internalUpgradeHeader, controlStreamUpgrade)
+	req.Header.Set(InternalUpgradeHeader, ControlStreamUpgrade)
+
+	edgeHTTP2Conn, err := testTransport.NewClientConn(edgeConn)
+	require.NoError(t, err)
+	resp, err := edgeHTTP2Conn.RoundTrip(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusBadGateway, resp.StatusCode)
+
+	assert.NotNil(t, http2Conn.controlStreamErr)
+	cancel()
+	wg.Wait()
+}
+
+func TestGracefulShutdownHTTP2(t *testing.T) {
+	http2Conn, edgeConn := newTestHTTP2Connection()
+
+	rpcClientFactory := mockRPCClientFactory{
+		registered:   make(chan struct{}),
+		unregistered: make(chan struct{}),
+	}
+	events := &eventCollectorSink{}
+	http2Conn.newRPCClientFunc = rpcClientFactory.newMockRPCClient
+	http2Conn.observer.RegisterSink(events)
+	shutdownC := make(chan struct{})
+	http2Conn.gracefulShutdownC = shutdownC
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		http2Conn.Serve(ctx)
+	}()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost:8080/", nil)
+	require.NoError(t, err)
+	req.Header.Set(InternalUpgradeHeader, ControlStreamUpgrade)
 
 	edgeHTTP2Conn, err := testTransport.NewClientConn(edgeConn)
 	require.NoError(t, err)
@@ -288,7 +329,7 @@ func TestGracefulShutdownHTTP2(t *testing.T) {
 	}
 
 	// signal graceful shutdown
-	close(http2Conn.gracefulShutdownC)
+	close(shutdownC)
 
 	select {
 	case <-rpcClientFactory.unregistered:
@@ -300,6 +341,11 @@ func TestGracefulShutdownHTTP2(t *testing.T) {
 
 	cancel()
 	wg.Wait()
+
+	events.assertSawEvent(t, Event{
+		Index:     http2Conn.connIndex,
+		EventType: Unregistering,
+	})
 }
 
 func benchmarkServeHTTP(b *testing.B, test testRequest) {

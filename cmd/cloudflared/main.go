@@ -2,24 +2,26 @@ package main
 
 import (
 	"fmt"
+	"math/rand"
 	"strings"
 	"time"
 
+	"github.com/getsentry/raven-go"
+	homedir "github.com/mitchellh/go-homedir"
+	"github.com/pkg/errors"
+	"github.com/urfave/cli/v2"
+	"go.uber.org/automaxprocs/maxprocs"
+
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/access"
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/cliutil"
-	"github.com/cloudflare/cloudflared/cmd/cloudflared/config"
+	"github.com/cloudflare/cloudflared/cmd/cloudflared/proxydns"
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/tunnel"
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/updater"
+	"github.com/cloudflare/cloudflared/config"
 	"github.com/cloudflare/cloudflared/logger"
 	"github.com/cloudflare/cloudflared/metrics"
 	"github.com/cloudflare/cloudflared/overwatch"
-	"github.com/cloudflare/cloudflared/tunneldns"
 	"github.com/cloudflare/cloudflared/watcher"
-
-	"github.com/getsentry/raven-go"
-	"github.com/mitchellh/go-homedir"
-	"github.com/pkg/errors"
-	"github.com/urfave/cli/v2"
 )
 
 const (
@@ -43,13 +45,12 @@ var (
 )
 
 func main() {
+	rand.Seed(time.Now().UnixNano())
 	metrics.RegisterBuildInfo(BuildTime, Version)
 	raven.SetRelease(Version)
+	maxprocs.Set()
 
-	// Force shutdown channel used by the app. When closed, app must terminate.
-	// Windows service manager closes this channel when it receives shutdown command.
-	shutdownC := make(chan struct{})
-	// Graceful shutdown channel used by the app. When closed, app must terminate.
+	// Graceful shutdown channel used by the app. When closed, app must terminate gracefully.
 	// Windows service manager closes this channel when it receives stop command.
 	graceShutdownC := make(chan struct{})
 
@@ -73,23 +74,24 @@ func main() {
 	app.Version = fmt.Sprintf("%s (built %s)", Version, BuildTime)
 	app.Description = `cloudflared connects your machine or user identity to Cloudflare's global network.
 	You can use it to authenticate a session to reach an API behind Access, route web traffic to this machine,
-	and configure access control.`
+	and configure access control.
+
+	See https://developers.cloudflare.com/argo-tunnel/ for more in-depth documentation.`
 	app.Flags = flags()
-	app.Action = action(Version, shutdownC, graceShutdownC)
-	app.Before = tunnel.SetFlagsFromConfigFile
+	app.Action = action(graceShutdownC)
 	app.Commands = commands(cli.ShowVersion)
 
-	tunnel.Init(Version, shutdownC, graceShutdownC) // we need this to support the tunnel sub command...
-	access.Init(shutdownC, graceShutdownC)
+	tunnel.Init(Version, graceShutdownC) // we need this to support the tunnel sub command...
+	access.Init(graceShutdownC)
 	updater.Init(Version)
-	runApp(app, shutdownC, graceShutdownC)
+	runApp(app, graceShutdownC)
 }
 
 func commands(version func(c *cli.Context)) []*cli.Command {
 	cmds := []*cli.Command{
 		{
 			Name:   "update",
-			Action: cliutil.ErrorHandler(updater.Update),
+			Action: cliutil.ConfiguredAction(updater.Update),
 			Usage:  "Update the agent if a new version exists",
 			Flags: []cli.Flag{
 				&cli.BoolFlag{
@@ -116,7 +118,7 @@ func commands(version func(c *cli.Context)) []*cli.Command {
 If a new version exists, updates the agent binary and quits.
 Otherwise, does nothing.
 
-To determine if an update happened in a script, check for error code 64.`,
+To determine if an update happened in a script, check for error code 11.`,
 		},
 		{
 			Name: "version",
@@ -129,7 +131,7 @@ To determine if an update happened in a script, check for error code 64.`,
 		},
 	}
 	cmds = append(cmds, tunnel.Commands()...)
-	cmds = append(cmds, tunneldns.Command(false))
+	cmds = append(cmds, proxydns.Command(false))
 	cmds = append(cmds, access.Commands()...)
 	return cmds
 }
@@ -143,10 +145,10 @@ func isEmptyInvocation(c *cli.Context) bool {
 	return c.NArg() == 0 && c.NumFlags() == 0
 }
 
-func action(version string, shutdownC, graceShutdownC chan struct{}) cli.ActionFunc {
-	return cliutil.ErrorHandler(func(c *cli.Context) (err error) {
+func action(graceShutdownC chan struct{}) cli.ActionFunc {
+	return cliutil.ConfiguredAction(func(c *cli.Context) (err error) {
 		if isEmptyInvocation(c) {
-			return handleServiceMode(c, shutdownC)
+			return handleServiceMode(c, graceShutdownC)
 		}
 		tags := make(map[string]string)
 		tags["hostname"] = c.String("hostname")

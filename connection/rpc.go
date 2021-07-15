@@ -6,11 +6,11 @@ import (
 	"io"
 	"time"
 
-	"github.com/cloudflare/cloudflared/tunnelrpc"
-	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
-
 	"github.com/rs/zerolog"
 	"zombiezen.com/go/capnproto2/rpc"
+
+	"github.com/cloudflare/cloudflared/tunnelrpc"
+	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
 )
 
 type tunnelServerClient struct {
@@ -291,6 +291,8 @@ func (h *h2muxConnection) registerNamedTunnel(
 }
 
 func (h *h2muxConnection) unregister(isNamedTunnel bool) {
+	h.observer.sendUnregisteringEvent(h.connIndex)
+
 	unregisterCtx, cancel := context.WithTimeout(context.Background(), h.config.GracePeriod)
 	defer cancel()
 

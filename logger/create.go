@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/mattn/go-colorable"
 	"github.com/rs/zerolog"
@@ -30,7 +31,17 @@ const (
 
 	dirPermMode  = 0744 // rwxr--r--
 	filePermMode = 0644 // rw-r--r--
+
+	consoleTimeFormat = time.RFC3339
 )
+
+func init() {
+	zerolog.TimestampFunc = utcNow
+}
+
+func utcNow() time.Time {
+	return time.Now().UTC()
+}
 
 func fallbackLogger(err error) *zerolog.Logger {
 	failLog := fallbacklog.With().Logger()
@@ -53,6 +64,7 @@ func (t resilientMultiWriter) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
+var levelErrorLogged = false
 
 func newZerolog(loggerConfig *Config) *zerolog.Logger {
 	var writers []io.Writer
@@ -81,11 +93,15 @@ func newZerolog(loggerConfig *Config) *zerolog.Logger {
 
 	multi := resilientMultiWriter{writers}
 
-	level, err := zerolog.ParseLevel(loggerConfig.MinLevel)
-	if err != nil {
-		return fallbackLogger(err)
+	level, levelErr := zerolog.ParseLevel(loggerConfig.MinLevel)
+	if levelErr != nil {
+		level = zerolog.InfoLevel
 	}
 	log := zerolog.New(multi).With().Timestamp().Logger().Level(level)
+	if !levelErrorLogged && levelErr != nil {
+		log.Error().Msgf("Failed to parse log level %q, using %q instead", loggerConfig.MinLevel, level)
+		levelErrorLogged = true
+	}
 
 	return &log
 }
@@ -141,8 +157,9 @@ func Create(loggerConfig *Config) *zerolog.Logger {
 func createConsoleLogger(config ConsoleConfig) io.Writer {
 	consoleOut := os.Stderr
 	return zerolog.ConsoleWriter{
-		Out:     colorable.NewColorable(consoleOut),
-		NoColor: config.noColor || !term.IsTerminal(int(consoleOut.Fd())),
+		Out:        colorable.NewColorable(consoleOut),
+		NoColor:    config.noColor || !term.IsTerminal(int(consoleOut.Fd())),
+		TimeFormat: consoleTimeFormat,
 	}
 }
 

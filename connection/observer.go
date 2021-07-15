@@ -5,9 +5,9 @@ import (
 	"net/url"
 	"strings"
 
-	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
-
 	"github.com/rs/zerolog"
+
+	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
 )
 
 const (
@@ -17,6 +17,7 @@ const (
 
 type Observer struct {
 	log             *zerolog.Logger
+	logTransport    *zerolog.Logger
 	metrics         *tunnelMetrics
 	tunnelEventChan chan Event
 	uiEnabled       bool
@@ -27,9 +28,10 @@ type EventSink interface {
 	OnTunnelEvent(event Event)
 }
 
-func NewObserver(log *zerolog.Logger, uiEnabled bool) *Observer {
+func NewObserver(log, logTransport *zerolog.Logger, uiEnabled bool) *Observer {
 	o := &Observer{
 		log:             log,
+		logTransport:    logTransport,
 		metrics:         newTunnelMetrics(),
 		uiEnabled:       uiEnabled,
 		tunnelEventChan: make(chan Event, observerChannelBufferSize),
@@ -56,7 +58,7 @@ func (o *Observer) logTrialHostname(registration *tunnelpogs.TunnelRegistration)
 	// Print out the user's trial zone URL in a nice box (if they requested and got one and UI flag is not set)
 	if !o.uiEnabled {
 		if registrationURL, err := url.Parse(registration.Url); err == nil {
-			for _, line := range asciiBox(trialZoneMsg(registrationURL.String()), 2) {
+			for _, line := range AsciiBox(TrialZoneMsg(registrationURL.String()), 2) {
 				o.log.Info().Msg(line)
 			}
 		} else {
@@ -68,7 +70,7 @@ func (o *Observer) logTrialHostname(registration *tunnelpogs.TunnelRegistration)
 }
 
 // Print out the given lines in a nice ASCII box.
-func asciiBox(lines []string, padding int) (box []string) {
+func AsciiBox(lines []string, padding int) (box []string) {
 	maxLen := maxLen(lines)
 	spacer := strings.Repeat(" ", padding)
 
@@ -92,7 +94,7 @@ func maxLen(lines []string) int {
 	return max
 }
 
-func trialZoneMsg(url string) []string {
+func TrialZoneMsg(url string) []string {
 	return []string{
 		"Your free tunnel has started! Visit it:",
 		"  " + url,
@@ -113,6 +115,10 @@ func (o *Observer) sendURL(url string) {
 
 func (o *Observer) SendReconnect(connIndex uint8) {
 	o.sendEvent(Event{Index: connIndex, EventType: Reconnecting})
+}
+
+func (o *Observer) sendUnregisteringEvent(connIndex uint8) {
+	o.sendEvent(Event{Index: connIndex, EventType: Unregistering})
 }
 
 func (o *Observer) SendDisconnect(connIndex uint8) {

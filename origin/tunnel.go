@@ -15,10 +15,10 @@ import (
 	"github.com/rs/zerolog"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/cloudflare/cloudflared/cmd/cloudflared/buildinfo"
 	"github.com/cloudflare/cloudflared/connection"
 	"github.com/cloudflare/cloudflared/edgediscovery"
 	"github.com/cloudflare/cloudflared/h2mux"
+	"github.com/cloudflare/cloudflared/retry"
 	"github.com/cloudflare/cloudflared/signal"
 	"github.com/cloudflare/cloudflared/tunnelrpc"
 	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
@@ -40,7 +40,7 @@ const (
 
 type TunnelConfig struct {
 	ConnectionConfig *connection.Config
-	BuildInfo        *buildinfo.BuildInfo
+	OSArch           string
 	ClientID         string
 	CloseConnOnce    *sync.Once // Used to close connectedSignal no more than once
 	EdgeAddrs        []string
@@ -51,6 +51,7 @@ type TunnelConfig struct {
 	LBPool           string
 	Tags             []tunnelpogs.Tag
 	Log              *zerolog.Logger
+	LogTransport     *zerolog.Logger
 	Observer         *connection.Observer
 	ReportedVersion  string
 	Retries          uint
@@ -71,7 +72,7 @@ func (c *TunnelConfig) RegistrationOptions(connectionID uint8, OriginLocalIP str
 	return &tunnelpogs.RegistrationOptions{
 		ClientID:             c.ClientID,
 		Version:              c.ReportedVersion,
-		OS:                   fmt.Sprintf("%s_%s", c.BuildInfo.GoOS, c.BuildInfo.GoArch),
+		OS:                   c.OSArch,
 		ExistingTunnelPolicy: policy,
 		PoolName:             c.LBPool,
 		Tags:                 c.Tags,
@@ -112,7 +113,7 @@ func StartTunnelDaemon(
 	config *TunnelConfig,
 	connectedSignal *signal.Signal,
 	reconnectCh chan ReconnectSignal,
-	graceShutdownC chan struct{},
+	graceShutdownC <-chan struct{},
 ) error {
 	s, err := NewSupervisor(config, reconnectCh, graceShutdownC)
 	if err != nil {
@@ -130,15 +131,15 @@ func ServeTunnelLoop(
 	connectedSignal *signal.Signal,
 	cloudflaredUUID uuid.UUID,
 	reconnectCh chan ReconnectSignal,
-	gracefulShutdownC chan struct{},
+	gracefulShutdownC <-chan struct{},
 ) error {
 	haConnections.Inc()
 	defer haConnections.Dec()
 
 	connLog := config.Log.With().Uint8(connection.LogFieldConnIndex, connIndex).Logger()
 
-	protocallFallback := &protocallFallback{
-		BackoffHandler{MaxRetries: config.Retries},
+	protocolFallback := &protocolFallback{
+		retry.BackoffHandler{MaxRetries: config.Retries},
 		config.ProtocolSelector.Current(),
 		false,
 	}
@@ -161,96 +162,99 @@ func ServeTunnelLoop(
 			addr,
 			connIndex,
 			connectedFuse,
-			protocallFallback,
+			protocolFallback,
 			cloudflaredUUID,
 			reconnectCh,
-			protocallFallback.protocol,
+			protocolFallback.protocol,
 			gracefulShutdownC,
 		)
 		if !recoverable {
 			return err
 		}
 
-		err = waitForBackoff(ctx, &connLog, protocallFallback, config, connIndex, err)
-		if err != nil {
+		config.Observer.SendReconnect(connIndex)
+
+		duration, ok := protocolFallback.GetMaxBackoffDuration(ctx)
+		if !ok {
 			return err
+		}
+		connLog.Info().Msgf("Retrying connection in up to %s seconds", duration)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-gracefulShutdownC:
+			return nil
+		case <-protocolFallback.BackoffTimer():
+			if !selectNextProtocol(&connLog, protocolFallback, config.ProtocolSelector) {
+				return err
+			}
 		}
 	}
 }
 
-// protocallFallback is a wrapper around backoffHandler that will try fallback option when backoff reaches
+// protocolFallback is a wrapper around backoffHandler that will try fallback option when backoff reaches
 // max retries
-type protocallFallback struct {
-	BackoffHandler
+type protocolFallback struct {
+	retry.BackoffHandler
 	protocol   connection.Protocol
 	inFallback bool
 }
 
-func (pf *protocallFallback) reset() {
-	pf.resetNow()
+func (pf *protocolFallback) reset() {
+	pf.ResetNow()
 	pf.inFallback = false
 }
 
-func (pf *protocallFallback) fallback(fallback connection.Protocol) {
-	pf.resetNow()
+func (pf *protocolFallback) fallback(fallback connection.Protocol) {
+	pf.ResetNow()
 	pf.protocol = fallback
 	pf.inFallback = true
 }
 
-// Expect err to always be non nil
-func waitForBackoff(
-	ctx context.Context,
-	log *zerolog.Logger,
-	protobackoff *protocallFallback,
-	config *TunnelConfig,
-	connIndex uint8,
-	err error,
-) error {
-	duration, ok := protobackoff.GetBackoffDuration(ctx)
-	if !ok {
-		return err
-	}
-
-	config.Observer.SendReconnect(connIndex)
-	log.Info().
-		Err(err).
-		Msgf("Retrying connection in %s seconds", duration)
-	protobackoff.Backoff(ctx)
-
-	if protobackoff.ReachedMaxRetries() {
-		fallback, hasFallback := config.ProtocolSelector.Fallback()
+// selectNextProtocol picks connection protocol for the next retry iteration,
+// returns true if it was able to pick the protocol, false if we are out of options and should stop retrying
+func selectNextProtocol(
+	connLog *zerolog.Logger,
+	protocolBackoff *protocolFallback,
+	selector connection.ProtocolSelector,
+) bool {
+	if protocolBackoff.ReachedMaxRetries() {
+		fallback, hasFallback := selector.Fallback()
 		if !hasFallback {
-			return err
+			return false
 		}
 		// Already using fallback protocol, no point to retry
-		if protobackoff.protocol == fallback {
-			return err
+		if protocolBackoff.protocol == fallback {
+			return false
 		}
-		log.Info().Msgf("Fallback to use %s", fallback)
-		protobackoff.fallback(fallback)
-	} else if !protobackoff.inFallback {
-		current := config.ProtocolSelector.Current()
-		if protobackoff.protocol != current {
-			protobackoff.protocol = current
-			config.Log.Info().Msgf("Change protocol to %s", current)
+		connLog.Info().Msgf("Switching to fallback protocol %s", fallback)
+		protocolBackoff.fallback(fallback)
+	} else if !protocolBackoff.inFallback {
+		current := selector.Current()
+		if protocolBackoff.protocol != current {
+			protocolBackoff.protocol = current
+			connLog.Info().Msgf("Changing protocol to %s", current)
 		}
 	}
-	return nil
+	return true
 }
 
+// ServeTunnel runs a single tunnel connection, returns nil on graceful shutdown,
+// on error returns a flag indicating if error can be retried
 func ServeTunnel(
 	ctx context.Context,
-	log *zerolog.Logger,
+	connLog *zerolog.Logger,
 	credentialManager *reconnectCredentialManager,
 	config *TunnelConfig,
 	addr *net.TCPAddr,
 	connIndex uint8,
 	fuse *h2mux.BooleanFuse,
-	backoff *protocallFallback,
+	backoff *protocolFallback,
 	cloudflaredUUID uuid.UUID,
 	reconnectCh chan ReconnectSignal,
 	protocol connection.Protocol,
-	gracefulShutdownC chan struct{},
+	gracefulShutdownC <-chan struct{},
 ) (err error, recoverable bool) {
 	// Treat panics as recoverable errors
 	defer func() {
@@ -269,17 +273,19 @@ func ServeTunnel(
 
 	edgeConn, err := edgediscovery.DialEdge(ctx, dialTimeout, config.EdgeTLSConfigs[protocol], addr)
 	if err != nil {
+		connLog.Err(err).Msg("Unable to establish connection with Cloudflare edge")
 		return err, true
 	}
 	connectedFuse := &connectedFuse{
 		fuse:    fuse,
 		backoff: backoff,
 	}
+
 	if protocol == connection.HTTP2 {
-		connOptions := config.ConnectionOptions(edgeConn.LocalAddr().String(), uint8(backoff.retries))
-		return ServeHTTP2(
+		connOptions := config.ConnectionOptions(edgeConn.LocalAddr().String(), uint8(backoff.Retries()))
+		err = ServeHTTP2(
 			ctx,
-			log,
+			connLog,
 			config,
 			edgeConn,
 			connOptions,
@@ -288,24 +294,65 @@ func ServeTunnel(
 			reconnectCh,
 			gracefulShutdownC,
 		)
+	} else {
+		err = ServeH2mux(
+			ctx,
+			connLog,
+			credentialManager,
+			config,
+			edgeConn,
+			connIndex,
+			connectedFuse,
+			cloudflaredUUID,
+			reconnectCh,
+			gracefulShutdownC,
+		)
 	}
-	return ServeH2mux(
-		ctx,
-		log,
-		credentialManager,
-		config,
-		edgeConn,
-		connIndex,
-		connectedFuse,
-		cloudflaredUUID,
-		reconnectCh,
-		gracefulShutdownC,
-	)
+
+	if err != nil {
+		switch err := err.(type) {
+		case connection.DupConnRegisterTunnelError:
+			connLog.Err(err).Msg("Unable to establish connection.")
+			// don't retry this connection anymore, let supervisor pick a new address
+			return err, false
+		case connection.ServerRegisterTunnelError:
+			connLog.Err(err).Msg("Register tunnel error from server side")
+			// Don't send registration error return from server to Sentry. They are
+			// logged on server side
+			if incidents := config.IncidentLookup.ActiveIncidents(); len(incidents) > 0 {
+				connLog.Error().Msg(activeIncidentsMsg(incidents))
+			}
+			return err.Cause, !err.Permanent
+		case ReconnectSignal:
+			connLog.Info().
+				Uint8(connection.LogFieldConnIndex, connIndex).
+				Msgf("Restarting connection due to reconnect signal in %s", err.Delay)
+			err.DelayBeforeReconnect()
+			return err, true
+		default:
+			if err == context.Canceled {
+				connLog.Debug().Err(err).Msgf("Serve tunnel error")
+				return err, false
+			}
+			connLog.Err(err).Msgf("Serve tunnel error")
+			_, permanent := err.(unrecoverableError)
+			return err, !permanent
+		}
+	}
+	return nil, false
+}
+
+type unrecoverableError struct {
+	err error
+}
+
+func (r unrecoverableError) Error() string {
+	return r.err.Error()
 }
 
 func ServeH2mux(
 	ctx context.Context,
-	log *zerolog.Logger,
+	connLog *zerolog.Logger,
 	credentialManager *reconnectCredentialManager,
 	config *TunnelConfig,
 	edgeConn net.Conn,
@@ -313,9 +360,9 @@ func ServeH2mux(
 	connectedFuse *connectedFuse,
 	cloudflaredUUID uuid.UUID,
 	reconnectCh chan ReconnectSignal,
-	gracefulShutdownC chan struct{},
-) (err error, recoverable bool) {
-	config.Log.Debug().Msgf("Connecting via h2mux")
+	gracefulShutdownC <-chan struct{},
+) error {
+	connLog.Debug().Msgf("Connecting via h2mux")
 	// Returns error from parsing the origin URL or handshake errors
 	handler, err, recoverable := connection.NewH2muxConnection(
 		config.ConnectionConfig,
@@ -326,72 +373,42 @@ func ServeH2mux(
 		gracefulShutdownC,
 	)
 	if err != nil {
-		return err, recoverable
+		if !recoverable {
+			return unrecoverableError{err}
+		}
+		return err
 	}
 
 	errGroup, serveCtx := errgroup.WithContext(ctx)
 
-	errGroup.Go(func() (err error) {
+	errGroup.Go(func() error {
 		if config.NamedTunnel != nil {
-			connOptions := config.ConnectionOptions(edgeConn.LocalAddr().String(), uint8(connectedFuse.backoff.retries))
+			connOptions := config.ConnectionOptions(edgeConn.LocalAddr().String(), uint8(connectedFuse.backoff.Retries()))
 			return handler.ServeNamedTunnel(serveCtx, config.NamedTunnel, connOptions, connectedFuse)
 		}
 		registrationOptions := config.RegistrationOptions(connIndex, edgeConn.LocalAddr().String(), cloudflaredUUID)
 		return handler.ServeClassicTunnel(serveCtx, config.ClassicTunnel, credentialManager, registrationOptions, connectedFuse)
 	})
 
-	errGroup.Go(listenReconnect(serveCtx, reconnectCh, gracefulShutdownC))
+	errGroup.Go(func() error {
+		return listenReconnect(serveCtx, reconnectCh, gracefulShutdownC)
+	})
 
-	err = errGroup.Wait()
-	if err != nil {
-		switch err := err.(type) {
-		case connection.DupConnRegisterTunnelError:
-			// don't retry this connection anymore, let supervisor pick a new address
-			return err, false
-		case connection.ServerRegisterTunnelError:
-			log.Err(err).Msg("Register tunnel error from server side")
-			// Don't send registration error return from server to Sentry. They are
-			// logged on server side
-			if incidents := config.IncidentLookup.ActiveIncidents(); len(incidents) > 0 {
-				log.Error().Msg(activeIncidentsMsg(incidents))
-			}
-			return err.Cause, !err.Permanent
-		case connection.MuxerShutdownError:
-			if handler.StoppedGracefully() {
-				return nil, false
-			}
-			log.Info().Msg("Unexpected muxer shutdown")
-			return err, true
-		case ReconnectSignal:
-			log.Info().
-				Uint8(connection.LogFieldConnIndex, connIndex).
-				Msgf("Restarting connection due to reconnect signal in %s", err.Delay)
-			err.DelayBeforeReconnect()
-			return err, true
-		default:
-			if err == context.Canceled {
-				log.Debug().Err(err).Msgf("Serve tunnel error")
-				return err, false
-			}
-			log.Err(err).Msgf("Serve tunnel error")
-			return err, true
-		}
-	}
-	return nil, true
+	return errGroup.Wait()
 }
 
 func ServeHTTP2(
 	ctx context.Context,
-	log *zerolog.Logger,
+	connLog *zerolog.Logger,
 	config *TunnelConfig,
 	tlsServerConn net.Conn,
 	connOptions *tunnelpogs.ConnectionOptions,
 	connIndex uint8,
 	connectedFuse connection.ConnectedFuse,
 	reconnectCh chan ReconnectSignal,
-	gracefulShutdownC chan struct{},
-) (err error, recoverable bool) {
-	log.Debug().Msgf("Connecting via http2")
+	gracefulShutdownC <-chan struct{},
+) error {
+	connLog.Debug().Msgf("Connecting via http2")
 	h2conn := connection.NewHTTP2Connection(
 		tlsServerConn,
 		config.ConnectionConfig,
@@ -408,31 +425,32 @@ func ServeHTTP2(
 		return h2conn.Serve(serveCtx)
 	})
 
-	errGroup.Go(listenReconnect(serveCtx, reconnectCh, gracefulShutdownC))
+	errGroup.Go(func() error {
+		err := listenReconnect(serveCtx, reconnectCh, gracefulShutdownC)
+		if err != nil {
+			// forcefully break the connection (this is only used for testing)
+			_ = tlsServerConn.Close()
+		}
+		return err
+	})
 
-	err = errGroup.Wait()
-	if err != nil {
-		return err, true
-	}
-	return nil, false
+	return errGroup.Wait()
 }
 
-func listenReconnect(ctx context.Context, reconnectCh <-chan ReconnectSignal, gracefulShutdownCh chan struct{}) func() error {
-	return func() error {
-		select {
-		case reconnect := <-reconnectCh:
-			return reconnect
-		case <-gracefulShutdownCh:
-			return nil
-		case <-ctx.Done():
-			return nil
-		}
+func listenReconnect(ctx context.Context, reconnectCh <-chan ReconnectSignal, gracefulShutdownCh <-chan struct{}) error {
+	select {
+	case reconnect := <-reconnectCh:
+		return reconnect
+	case <-gracefulShutdownCh:
+		return nil
+	case <-ctx.Done():
+		return nil
 	}
 }
 
 type connectedFuse struct {
 	fuse    *h2mux.BooleanFuse
-	backoff *protocallFallback
+	backoff *protocolFallback
 }
 
 func (cf *connectedFuse) Connected() {

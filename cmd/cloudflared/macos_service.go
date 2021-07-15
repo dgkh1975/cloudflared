@@ -6,18 +6,18 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/cloudflare/cloudflared/cmd/cloudflared/cliutil"
-	"github.com/cloudflare/cloudflared/logger"
-
 	"github.com/pkg/errors"
 	"github.com/urfave/cli/v2"
+
+	"github.com/cloudflare/cloudflared/cmd/cloudflared/cliutil"
+	"github.com/cloudflare/cloudflared/logger"
 )
 
 const (
 	launchdIdentifier = "com.cloudflare.cloudflared"
 )
 
-func runApp(app *cli.App, shutdownC, graceShutdownC chan struct{}) {
+func runApp(app *cli.App, graceShutdownC chan struct{}) {
 	app.Commands = append(app.Commands, &cli.Command{
 		Name:  "service",
 		Usage: "Manages the Argo Tunnel launch agent",
@@ -25,12 +25,12 @@ func runApp(app *cli.App, shutdownC, graceShutdownC chan struct{}) {
 			{
 				Name:   "install",
 				Usage:  "Install Argo Tunnel as an user launch agent",
-				Action: cliutil.ErrorHandler(installLaunchd),
+				Action: cliutil.ConfiguredAction(installLaunchd),
 			},
 			{
 				Name:   "uninstall",
 				Usage:  "Uninstall the Argo Tunnel launch agent",
-				Action: cliutil.ErrorHandler(uninstallLaunchd),
+				Action: cliutil.ConfiguredAction(uninstallLaunchd),
 			},
 		},
 	})

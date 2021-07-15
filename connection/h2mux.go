@@ -7,13 +7,13 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/cloudflare/cloudflared/h2mux"
-	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
-	"github.com/cloudflare/cloudflared/websocket"
-
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/cloudflare/cloudflared/h2mux"
+	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
+	"github.com/cloudflare/cloudflared/websocket"
 )
 
 const (
@@ -30,7 +30,7 @@ type h2muxConnection struct {
 	connIndex    uint8
 
 	observer          *Observer
-	gracefulShutdownC chan struct{}
+	gracefulShutdownC <-chan struct{}
 	stoppedGracefully bool
 
 	// newRPCClientFunc allows us to mock RPCs during testing
@@ -63,7 +63,7 @@ func NewH2muxConnection(
 	edgeConn net.Conn,
 	connIndex uint8,
 	observer *Observer,
-	gracefulShutdownC chan struct{},
+	gracefulShutdownC <-chan struct{},
 ) (*h2muxConnection, error, bool) {
 	h := &h2muxConnection{
 		config:            config,
@@ -77,7 +77,7 @@ func NewH2muxConnection(
 
 	// Establish a muxed connection with the edge
 	// Client mux handshake with agent server
-	muxer, err := h2mux.Handshake(edgeConn, edgeConn, *muxerConfig.H2MuxerConfig(h, observer.log), h2mux.ActiveStreams)
+	muxer, err := h2mux.Handshake(edgeConn, edgeConn, *muxerConfig.H2MuxerConfig(h, observer.logTransport), h2mux.ActiveStreams)
 	if err != nil {
 		recoverable := isHandshakeErrRecoverable(err, connIndex, observer)
 		return nil, err, recoverable
@@ -104,7 +104,15 @@ func (h *h2muxConnection) ServeNamedTunnel(ctx context.Context, namedTunnel *Nam
 		h.controlLoop(serveCtx, connectedFuse, true)
 		return nil
 	})
-	return errGroup.Wait()
+
+	err := errGroup.Wait()
+	if err == errMuxerStopped {
+		if h.stoppedGracefully {
+			return nil
+		}
+		h.observer.log.Info().Uint8(LogFieldConnIndex, h.connIndex).Msg("Unexpected muxer shutdown")
+	}
+	return err
 }
 
 func (h *h2muxConnection) ServeClassicTunnel(ctx context.Context, classicTunnel *ClassicTunnelConfig, credentialManager CredentialManager, registrationOptions *tunnelpogs.RegistrationOptions, connectedFuse ConnectedFuse) error {
@@ -136,11 +144,15 @@ func (h *h2muxConnection) ServeClassicTunnel(ctx context.Context, classicTunnel 
 		h.controlLoop(serveCtx, connectedFuse, false)
 		return nil
 	})
-	return errGroup.Wait()
-}
 
-func (h *h2muxConnection) StoppedGracefully() bool {
-	return h.stoppedGracefully
+	err := errGroup.Wait()
+	if err == errMuxerStopped {
+		if h.stoppedGracefully {
+			return nil
+		}
+		h.observer.log.Info().Uint8(LogFieldConnIndex, h.connIndex).Msg("Unexpected muxer shutdown")
+	}
+	return err
 }
 
 func (h *h2muxConnection) serveMuxer(ctx context.Context) error {
@@ -155,7 +167,9 @@ func (h *h2muxConnection) serveMuxer(ctx context.Context) error {
 }
 
 func (h *h2muxConnection) controlLoop(ctx context.Context, connectedFuse ConnectedFuse, isNamedTunnel bool) {
-	updateMetricsTickC := time.Tick(h.muxerConfig.MetricsUpdateFreq)
+	updateMetricsTicker := time.NewTicker(h.muxerConfig.MetricsUpdateFreq)
+	defer updateMetricsTicker.Stop()
+	var shutdownCompleted <-chan struct{}
 	for {
 		select {
 		case <-h.gracefulShutdownC:
@@ -164,6 +178,10 @@ func (h *h2muxConnection) controlLoop(ctx context.Context, connectedFuse Connect
 			}
 			h.stoppedGracefully = true
 			h.gracefulShutdownC = nil
+			shutdownCompleted = h.muxer.Shutdown()
+
+		case <-shutdownCompleted:
+			return
 
 		case <-ctx.Done():
 			// UnregisterTunnel blocks until the RPC call returns
@@ -171,9 +189,10 @@ func (h *h2muxConnection) controlLoop(ctx context.Context, connectedFuse Connect
 				h.unregister(isNamedTunnel)
 			}
 			h.muxer.Shutdown()
+			// don't wait for shutdown to finish when context is closed, this is the hard termination path
 			return
 
-		case <-updateMetricsTickC:
+		case <-updateMetricsTicker.C:
 			h.observer.metrics.updateMuxerMetrics(h.connIndexStr, h.muxer.Metrics())
 		}
 	}
@@ -198,7 +217,12 @@ func (h *h2muxConnection) ServeStream(stream *h2mux.MuxedStream) error {
 		return reqErr
 	}
 
-	err := h.config.OriginClient.Proxy(respWriter, req, websocket.IsWebSocketUpgrade(req))
+	var sourceConnectionType = TypeHTTP
+	if websocket.IsWebSocketUpgrade(req) {
+		sourceConnectionType = TypeWebsocket
+	}
+
+	err := h.config.OriginProxy.Proxy(respWriter, req, sourceConnectionType)
 	if err != nil {
 		respWriter.WriteErrorResponse()
 		return err
@@ -211,7 +235,7 @@ func (h *h2muxConnection) newRequest(stream *h2mux.MuxedStream) (*http.Request, 
 	if err != nil {
 		return nil, errors.Wrap(err, "Unexpected error from http.NewRequest")
 	}
-	err = h2mux.H2RequestHeadersToH1Request(stream.Headers, req)
+	err = H2RequestHeadersToH1Request(stream.Headers, req)
 	if err != nil {
 		return nil, errors.Wrap(err, "invalid request received")
 	}
@@ -222,16 +246,16 @@ type h2muxRespWriter struct {
 	*h2mux.MuxedStream
 }
 
-func (rp *h2muxRespWriter) WriteRespHeaders(resp *http.Response) error {
-	headers := h2mux.H1ResponseToH2ResponseHeaders(resp)
-	headers = append(headers, h2mux.Header{Name: ResponseMetaHeaderField, Value: responseMetaHeaderOrigin})
+func (rp *h2muxRespWriter) WriteRespHeaders(status int, header http.Header) error {
+	headers := H1ResponseToH2ResponseHeaders(status, header)
+	headers = append(headers, h2mux.Header{Name: ResponseMetaHeader, Value: responseMetaHeaderOrigin})
 	return rp.WriteHeaders(headers)
 }
 
 func (rp *h2muxRespWriter) WriteErrorResponse() {
 	_ = rp.WriteHeaders([]h2mux.Header{
 		{Name: ":status", Value: "502"},
-		{Name: ResponseMetaHeaderField, Value: responseMetaHeaderCfd},
+		{Name: ResponseMetaHeader, Value: responseMetaHeaderCfd},
 	})
 	_, _ = rp.Write([]byte("502 Bad Gateway"))
 }

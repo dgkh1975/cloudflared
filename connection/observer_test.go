@@ -44,7 +44,7 @@ func TestRegisterServerLocation(t *testing.T) {
 }
 
 func TestObserverEventsDontBlock(t *testing.T) {
-	observer := NewObserver(&log, false)
+	observer := NewObserver(&log, &log, false)
 	var mu sync.Mutex
 	observer.RegisterSink(EventSinkFunc(func(_ Event) {
 		// callback will block if lock is already held
@@ -65,4 +65,21 @@ func TestObserverEventsDontBlock(t *testing.T) {
 		// release the callback if timer hasn't expired yet
 		mu.Unlock()
 	}
+}
+
+type eventCollectorSink struct {
+	observedEvents []Event
+	mu             sync.Mutex
+}
+
+func (s *eventCollectorSink) OnTunnelEvent(event Event) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.observedEvents = append(s.observedEvents, event)
+}
+
+func (s *eventCollectorSink) assertSawEvent(t *testing.T, event Event) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	assert.Contains(t, s.observedEvents, event)
 }

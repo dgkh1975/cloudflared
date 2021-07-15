@@ -10,17 +10,18 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/cloudflare/cloudflared/h2mux"
-	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
-
 	"github.com/rs/zerolog"
 	"golang.org/x/net/http2"
+
+	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
 )
 
+// note: these constants are exported so we can reuse them in the edge-side code
 const (
-	internalUpgradeHeader = "Cf-Cloudflared-Proxy-Connection-Upgrade"
-	websocketUpgrade      = "websocket"
-	controlStreamUpgrade  = "control-stream"
+	InternalUpgradeHeader     = "Cf-Cloudflared-Proxy-Connection-Upgrade"
+	InternalTCPProxySrcHeader = "Cf-Cloudflared-Proxy-Src"
+	WebsocketUpgrade          = "websocket"
+	ControlStreamUpgrade      = "control-stream"
 )
 
 var errEdgeConnectionClosed = fmt.Errorf("connection with edge closed")
@@ -34,12 +35,14 @@ type http2Connection struct {
 	observer     *Observer
 	connIndexStr string
 	connIndex    uint8
-	wg           *sync.WaitGroup
 	// newRPCClientFunc allows us to mock RPCs during testing
-	newRPCClientFunc  func(context.Context, io.ReadWriteCloser, *zerolog.Logger) NamedTunnelRPCClient
+	newRPCClientFunc func(context.Context, io.ReadWriteCloser, *zerolog.Logger) NamedTunnelRPCClient
+
+	activeRequestsWG  sync.WaitGroup
 	connectedFuse     ConnectedFuse
-	gracefulShutdownC chan struct{}
+	gracefulShutdownC <-chan struct{}
 	stoppedGracefully bool
+	controlStreamErr  error // result of running control stream handler
 }
 
 func NewHTTP2Connection(
@@ -50,7 +53,7 @@ func NewHTTP2Connection(
 	observer *Observer,
 	connIndex uint8,
 	connectedFuse ConnectedFuse,
-	gracefulShutdownC chan struct{},
+	gracefulShutdownC <-chan struct{},
 ) *http2Connection {
 	return &http2Connection{
 		conn: conn,
@@ -63,7 +66,6 @@ func NewHTTP2Connection(
 		observer:          observer,
 		connIndexStr:      uint8ToString(connIndex),
 		connIndex:         connIndex,
-		wg:                &sync.WaitGroup{},
 		newRPCClientFunc:  newRegistrationRPCClient,
 		connectedFuse:     connectedFuse,
 		gracefulShutdownC: gracefulShutdownC,
@@ -80,46 +82,44 @@ func (c *http2Connection) Serve(ctx context.Context) error {
 		Handler: c,
 	})
 
-	if !c.stoppedGracefully {
+	switch {
+	case c.stoppedGracefully:
+		return nil
+	case c.controlStreamErr != nil:
+		return c.controlStreamErr
+	default:
+		c.observer.log.Info().Uint8(LogFieldConnIndex, c.connIndex).Msg("Lost connection with the edge")
 		return errEdgeConnectionClosed
 	}
-	return nil
 }
 
 func (c *http2Connection) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	c.wg.Add(1)
-	defer c.wg.Done()
+	c.activeRequestsWG.Add(1)
+	defer c.activeRequestsWG.Done()
 
-	respWriter := &http2RespWriter{
-		r: r.Body,
-		w: w,
-	}
-	flusher, isFlusher := w.(http.Flusher)
-	if !isFlusher {
-		c.observer.log.Error().Msgf("%T doesn't implement http.Flusher", w)
-		respWriter.WriteErrorResponse()
+	connType := determineHTTP2Type(r)
+	handleMissingRequestParts(connType, r)
+
+	respWriter, err := newHTTP2RespWriter(r, w, connType)
+	if err != nil {
+		c.observer.log.Error().Msg(err.Error())
 		return
 	}
-	respWriter.flusher = flusher
-	var err error
-	if isControlStreamUpgrade(r) {
-		respWriter.shouldFlush = true
-		err = c.serveControlStream(r.Context(), respWriter)
-	} else if isWebsocketUpgrade(r) {
-		respWriter.shouldFlush = true
-		stripWebsocketUpgradeHeader(r)
-		err = c.config.OriginClient.Proxy(respWriter, r, true)
-	} else {
-		err = c.config.OriginClient.Proxy(respWriter, r, false)
-	}
 
-	if err != nil {
+	var proxyErr error
+	switch connType {
+	case TypeControlStream:
+		proxyErr = c.serveControlStream(r.Context(), respWriter)
+		c.controlStreamErr = proxyErr
+	case TypeWebsocket:
+		stripWebsocketUpgradeHeader(r)
+		proxyErr = c.config.OriginProxy.Proxy(respWriter, r, TypeWebsocket)
+	default:
+		proxyErr = c.config.OriginProxy.Proxy(respWriter, r, connType)
+	}
+	if proxyErr != nil {
 		respWriter.WriteErrorResponse()
 	}
-}
-
-func (c *http2Connection) StoppedGracefully() bool {
-	return c.stoppedGracefully
 }
 
 func (c *http2Connection) serveControlStream(ctx context.Context, respWriter *http2RespWriter) error {
@@ -139,6 +139,7 @@ func (c *http2Connection) serveControlStream(ctx context.Context, respWriter *ht
 		c.stoppedGracefully = true
 	}
 
+	c.observer.sendUnregisteringEvent(c.connIndex)
 	rpcClient.GracefulShutdown(ctx, c.config.GracePeriod)
 	c.observer.log.Info().Uint8(LogFieldConnIndex, c.connIndex).Msg("Unregistered tunnel connection")
 	return nil
@@ -146,7 +147,7 @@ func (c *http2Connection) serveControlStream(ctx context.Context, respWriter *ht
 
 func (c *http2Connection) close() {
 	// Wait for all serve HTTP handlers to return
-	c.wg.Wait()
+	c.activeRequestsWG.Wait()
 	c.conn.Close()
 }
 
@@ -157,36 +158,52 @@ type http2RespWriter struct {
 	shouldFlush bool
 }
 
-func (rp *http2RespWriter) WriteRespHeaders(resp *http.Response) error {
+func newHTTP2RespWriter(r *http.Request, w http.ResponseWriter, connType Type) (*http2RespWriter, error) {
+	flusher, isFlusher := w.(http.Flusher)
+	if !isFlusher {
+		respWriter := &http2RespWriter{
+			r: r.Body,
+			w: w,
+		}
+		respWriter.WriteErrorResponse()
+		return nil, fmt.Errorf("%T doesn't implement http.Flusher", w)
+	}
+
+	return &http2RespWriter{
+		r:           r.Body,
+		w:           w,
+		flusher:     flusher,
+		shouldFlush: connType.shouldFlush(),
+	}, nil
+}
+
+func (rp *http2RespWriter) WriteRespHeaders(status int, header http.Header) error {
 	dest := rp.w.Header()
-	userHeaders := make(http.Header, len(resp.Header))
-	for header, values := range resp.Header {
+	userHeaders := make(http.Header, len(header))
+	for name, values := range header {
 		// Since these are http2 headers, they're required to be lowercase
-		h2name := strings.ToLower(header)
-		for _, v := range values {
-			if h2name == "content-length" {
-				// This header has meaning in HTTP/2 and will be used by the edge,
-				// so it should be sent as an HTTP/2 response header.
-				dest.Add(h2name, v)
-				// Since these are http2 headers, they're required to be lowercase
-			} else if !h2mux.IsControlHeader(h2name) || h2mux.IsWebsocketClientHeader(h2name) {
-				// User headers, on the other hand, must all be serialized so that
-				// HTTP/2 header validation won't be applied to HTTP/1 header values
-				userHeaders.Add(h2name, v)
-			}
+		h2name := strings.ToLower(name)
+		if h2name == "content-length" {
+			// This header has meaning in HTTP/2 and will be used by the edge,
+			// so it should be sent as an HTTP/2 response header.
+			dest[name] = values
+			// Since these are http2 headers, they're required to be lowercase
+		} else if !IsControlHeader(h2name) || IsWebsocketClientHeader(h2name) {
+			// User headers, on the other hand, must all be serialized so that
+			// HTTP/2 header validation won't be applied to HTTP/1 header values
+			userHeaders[name] = values
 		}
 	}
 
 	// Perform user header serialization and set them in the single header
-	dest.Set(canonicalResponseUserHeadersField, h2mux.SerializeHeaders(userHeaders))
+	dest.Set(CanonicalResponseUserHeaders, SerializeHeaders(userHeaders))
 	rp.setResponseMetaHeader(responseMetaHeaderOrigin)
-	status := resp.StatusCode
 	// HTTP2 removes support for 101 Switching Protocols https://tools.ietf.org/html/rfc7540#section-8.1.1
 	if status == http.StatusSwitchingProtocols {
 		status = http.StatusOK
 	}
 	rp.w.WriteHeader(status)
-	if IsServerSentEvent(resp.Header) {
+	if IsServerSentEvent(header) {
 		rp.shouldFlush = true
 	}
 	if rp.shouldFlush {
@@ -201,7 +218,7 @@ func (rp *http2RespWriter) WriteErrorResponse() {
 }
 
 func (rp *http2RespWriter) setResponseMetaHeader(value string) {
-	rp.w.Header().Set(canonicalResponseMetaHeaderField, value)
+	rp.w.Header().Set(CanonicalResponseMetaHeader, value)
 }
 
 func (rp *http2RespWriter) Read(p []byte) (n int, err error) {
@@ -227,14 +244,46 @@ func (rp *http2RespWriter) Close() error {
 	return nil
 }
 
+func determineHTTP2Type(r *http.Request) Type {
+	switch {
+	case isWebsocketUpgrade(r):
+		return TypeWebsocket
+	case IsTCPStream(r):
+		return TypeTCP
+	case isControlStreamUpgrade(r):
+		return TypeControlStream
+	default:
+		return TypeHTTP
+	}
+}
+
+func handleMissingRequestParts(connType Type, r *http.Request) {
+	if connType == TypeHTTP {
+		// http library has no guarantees that we receive a filled URL. If not, then we fill it, as we reuse the request
+		// for proxying. We use the same values as we used to in h2mux. For proxying they should not matter since we
+		// control the dialer on every egress proxied.
+		if len(r.URL.Scheme) == 0 {
+			r.URL.Scheme = "http"
+		}
+		if len(r.URL.Host) == 0 {
+			r.URL.Host = "localhost:8080"
+		}
+	}
+}
+
 func isControlStreamUpgrade(r *http.Request) bool {
-	return strings.ToLower(r.Header.Get(internalUpgradeHeader)) == controlStreamUpgrade
+	return r.Header.Get(InternalUpgradeHeader) == ControlStreamUpgrade
 }
 
 func isWebsocketUpgrade(r *http.Request) bool {
-	return strings.ToLower(r.Header.Get(internalUpgradeHeader)) == websocketUpgrade
+	return r.Header.Get(InternalUpgradeHeader) == WebsocketUpgrade
+}
+
+// IsTCPStream discerns if the connection request needs a tcp stream proxy.
+func IsTCPStream(r *http.Request) bool {
+	return r.Header.Get(InternalTCPProxySrcHeader) != ""
 }
 
 func stripWebsocketUpgradeHeader(r *http.Request) {
-	r.Header.Del(internalUpgradeHeader)
+	r.Header.Del(InternalUpgradeHeader)
 }

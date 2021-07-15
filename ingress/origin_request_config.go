@@ -3,9 +3,11 @@ package ingress
 import (
 	"time"
 
-	"github.com/cloudflare/cloudflared/cmd/cloudflared/config"
-	"github.com/cloudflare/cloudflared/tlsconfig"
 	"github.com/urfave/cli/v2"
+
+	"github.com/cloudflare/cloudflared/config"
+	"github.com/cloudflare/cloudflared/ipaccess"
+	"github.com/cloudflare/cloudflared/tlsconfig"
 )
 
 const (
@@ -20,7 +22,7 @@ const (
 	Socks5Flag                    = "socks5"
 	ProxyConnectTimeoutFlag       = "proxy-connect-timeout"
 	ProxyTLSTimeoutFlag           = "proxy-tls-timeout"
-	ProxyTCPKeepAlive             = "proxy-tcp-keepalive"
+	ProxyTCPKeepAliveFlag         = "proxy-tcp-keepalive"
 	ProxyNoHappyEyeballsFlag      = "proxy-no-happy-eyeballs"
 	ProxyKeepAliveConnectionsFlag = "proxy-keepalive-connections"
 	ProxyKeepAliveTimeoutFlag     = "proxy-keepalive-timeout"
@@ -58,7 +60,7 @@ func originRequestFromSingeRule(c *cli.Context) OriginRequestConfig {
 	if flag := ProxyTLSTimeoutFlag; c.IsSet(flag) {
 		tlsTimeout = c.Duration(flag)
 	}
-	if flag := ProxyTCPKeepAlive; c.IsSet(flag) {
+	if flag := ProxyTCPKeepAliveFlag; c.IsSet(flag) {
 		tcpKeepAlive = c.Duration(flag)
 	}
 	if flag := ProxyNoHappyEyeballsFlag; c.IsSet(flag) {
@@ -212,6 +214,8 @@ type OriginRequestConfig struct {
 	ProxyPort uint `yaml:"proxyPort"`
 	// What sort of proxy should be started
 	ProxyType string `yaml:"proxyType"`
+	// IP rules for the proxy service
+	IPRules []ipaccess.Rule `yaml:"ipRules"`
 }
 
 func (defaults *OriginRequestConfig) setConnectTimeout(overrides config.OriginRequestConfig) {

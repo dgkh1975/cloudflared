@@ -19,15 +19,14 @@ const (
 
 var (
 	testConfig = &Config{
-		OriginClient: &mockOriginClient{},
-		GracePeriod:  time.Millisecond * 100,
+		OriginProxy: &mockOriginProxy{},
+		GracePeriod: time.Millisecond * 100,
 	}
 	log           = zerolog.Nop()
 	testOriginURL = &url.URL{
 		Scheme: "https",
 		Host:   "connectiontest.argotunnel.com",
 	}
-	testObserver        = NewObserver(&log, false)
 	testLargeResp = make([]byte, largeFileSize)
 )
 
@@ -39,11 +38,11 @@ type testRequest struct {
 	isProxyError   bool
 }
 
-type mockOriginClient struct {
+type mockOriginProxy struct {
 }
 
-func (moc *mockOriginClient) Proxy(w ResponseWriter, r *http.Request, isWebsocket bool) error {
-	if isWebsocket {
+func (moc *mockOriginProxy) Proxy(w ResponseWriter, r *http.Request, sourceConnectionType Type) error {
+	if sourceConnectionType == TypeWebsocket {
 		return wsEndpoint(w, r)
 	}
 	switch r.URL.Path {
@@ -75,7 +74,7 @@ func wsEndpoint(w ResponseWriter, r *http.Request) error {
 	resp := &http.Response{
 		StatusCode: http.StatusSwitchingProtocols,
 	}
-	_ = w.WriteRespHeaders(resp)
+	_ = w.WriteRespHeaders(resp.StatusCode, resp.Header)
 	clientReader := nowriter{r.Body}
 	go func() {
 		for {
@@ -96,7 +95,7 @@ func originRespEndpoint(w ResponseWriter, status int, data []byte) {
 	resp := &http.Response{
 		StatusCode: status,
 	}
-	_ = w.WriteRespHeaders(resp)
+	_ = w.WriteRespHeaders(resp.StatusCode, resp.Header)
 	_, _ = w.Write(data)
 }
 

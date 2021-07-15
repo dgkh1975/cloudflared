@@ -12,13 +12,15 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/cloudflare/cloudflared/logger"
-
+	"github.com/pkg/errors"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.org/x/sys/windows/svc/mgr"
+
+	"github.com/cloudflare/cloudflared/cmd/cloudflared/cliutil"
+	"github.com/cloudflare/cloudflared/logger"
 )
 
 const (
@@ -40,20 +42,20 @@ const (
 	LogFieldWindowsServiceName = "windowsServiceName"
 )
 
-func runApp(app *cli.App, shutdownC, graceShutdownC chan struct{}) {
+func runApp(app *cli.App, graceShutdownC chan struct{}) {
 	app.Commands = append(app.Commands, &cli.Command{
 		Name:  "service",
 		Usage: "Manages the Argo Tunnel Windows service",
 		Subcommands: []*cli.Command{
-			&cli.Command{
+			{
 				Name:   "install",
 				Usage:  "Install Argo Tunnel as a Windows service",
-				Action: installWindowsService,
+				Action: cliutil.ConfiguredAction(installWindowsService),
 			},
-			&cli.Command{
+			{
 				Name:   "uninstall",
 				Usage:  "Uninstall the Argo Tunnel service",
-				Action: uninstallWindowsService,
+				Action: cliutil.ConfiguredAction(uninstallWindowsService),
 			},
 		},
 	})
@@ -82,7 +84,7 @@ func runApp(app *cli.App, shutdownC, graceShutdownC chan struct{}) {
 	// Run executes service name by calling windowsService which is a Handler
 	// interface that implements Execute method.
 	// It will set service status to stop after Execute returns
-	err = svc.Run(windowsServiceName, &windowsService{app: app, shutdownC: shutdownC, graceShutdownC: graceShutdownC})
+	err = svc.Run(windowsServiceName, &windowsService{app: app, graceShutdownC: graceShutdownC})
 	if err != nil {
 		if errno, ok := err.(syscall.Errno); ok && int(errno) == serviceControllerConnectionFailure {
 			// Hack: assume this is a false negative from the IsAnInteractiveSession() check above.
@@ -96,11 +98,11 @@ func runApp(app *cli.App, shutdownC, graceShutdownC chan struct{}) {
 
 type windowsService struct {
 	app            *cli.App
-	shutdownC      chan struct{}
 	graceShutdownC chan struct{}
 }
 
-// called by the package code at the start of the service
+// Execute is called by the service manager when service starts, the state
+// of the service will be set to Stopped when this function returns.
 func (s *windowsService) Execute(serviceArgs []string, r <-chan svc.ChangeRequest, statusChan chan<- svc.Status) (ssec bool, errno uint32) {
 	log := logger.Create(nil)
 	elog, err := eventlog.Open(windowsServiceName)
@@ -128,13 +130,12 @@ func (s *windowsService) Execute(serviceArgs []string, r <-chan svc.ChangeReques
 	}
 	elog.Info(1, fmt.Sprintf("%s service arguments: %v", windowsServiceName, args))
 
-	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown
 	statusChan <- svc.Status{State: svc.StartPending}
 	errC := make(chan error)
 	go func() {
 		errC <- s.app.Run(args)
 	}()
-	statusChan <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
+	statusChan <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
 
 	for {
 		select {
@@ -143,17 +144,25 @@ func (s *windowsService) Execute(serviceArgs []string, r <-chan svc.ChangeReques
 			case svc.Interrogate:
 				statusChan <- c.CurrentStatus
 			case svc.Stop, svc.Shutdown:
-				close(s.graceShutdownC)
-				statusChan <- svc.Status{State: svc.Stopped, Accepts: cmdsAccepted}
+				if s.graceShutdownC != nil {
+					// start graceful shutdown
+					elog.Info(1, "cloudflared starting graceful shutdown")
+					close(s.graceShutdownC)
+					s.graceShutdownC = nil
+					statusChan <- svc.Status{State: svc.StopPending}
+					continue
+				}
+				// repeated attempts at graceful shutdown forces immediate stop
+				elog.Info(1, "cloudflared terminating immediately")
 				statusChan <- svc.Status{State: svc.StopPending}
-				return
+				return false, 0
 			default:
 				elog.Error(1, fmt.Sprintf("unexpected control request #%d", c))
 			}
 		case err := <-errC:
-			ssec = true
 			if err != nil {
 				elog.Error(1, fmt.Sprintf("cloudflared terminated with error %v", err))
+				ssec = true
 				errno = 1
 			} else {
 				elog.Info(1, "cloudflared terminated without error")
@@ -170,35 +179,30 @@ func installWindowsService(c *cli.Context) error {
 	zeroLogger.Info().Msg("Installing Argo Tunnel Windows service")
 	exepath, err := os.Executable()
 	if err != nil {
-		zeroLogger.Err(err).Msg("Cannot find path name that start the process")
-		return err
+		return errors.Wrap(err, "Cannot find path name that start the process")
 	}
 	m, err := mgr.Connect()
 	if err != nil {
-		zeroLogger.Err(err).Msg("Cannot establish a connection to the service control manager")
-		return err
+		return errors.Wrap(err, "Cannot establish a connection to the service control manager")
 	}
 	defer m.Disconnect()
 	s, err := m.OpenService(windowsServiceName)
 	log := zeroLogger.With().Str(LogFieldWindowsServiceName, windowsServiceName).Logger()
 	if err == nil {
 		s.Close()
-		log.Err(err).Msg("service already exists")
-		return fmt.Errorf("service %s already exists", windowsServiceName)
+		return fmt.Errorf("Service %s already exists", windowsServiceName)
 	}
 	config := mgr.Config{StartType: mgr.StartAutomatic, DisplayName: windowsServiceDescription}
 	s, err = m.CreateService(windowsServiceName, exepath, config)
 	if err != nil {
-		log.Error().Msg("Cannot install service")
-		return err
+		return errors.Wrap(err, "Cannot install service")
 	}
 	defer s.Close()
 	log.Info().Msg("Argo Tunnel agent service is installed")
 	err = eventlog.InstallAsEventCreate(windowsServiceName, eventlog.Error|eventlog.Warning|eventlog.Info)
 	if err != nil {
 		s.Delete()
-		log.Err(err).Msg("Cannot install event logger")
-		return fmt.Errorf("SetupEventLogSource() failed: %s", err)
+		return errors.Wrap(err, "Cannot install event logger")
 	}
 	err = configRecoveryOption(s.Handle)
 	if err != nil {
@@ -216,26 +220,22 @@ func uninstallWindowsService(c *cli.Context) error {
 	log.Info().Msg("Uninstalling Argo Tunnel Windows Service")
 	m, err := mgr.Connect()
 	if err != nil {
-		log.Error().Msg("Cannot establish a connection to the service control manager")
-		return err
+		return errors.Wrap(err, "Cannot establish a connection to the service control manager")
 	}
 	defer m.Disconnect()
 	s, err := m.OpenService(windowsServiceName)
 	if err != nil {
-		log.Error().Msg("service is not installed")
-		return fmt.Errorf("service %s is not installed", windowsServiceName)
+		return fmt.Errorf("Service %s is not installed", windowsServiceName)
 	}
 	defer s.Close()
 	err = s.Delete()
 	if err != nil {
-		log.Error().Msg("Cannot delete service")
-		return err
+		return errors.Wrap(err, "Cannot delete service")
 	}
 	log.Info().Msg("Argo Tunnel agent service is uninstalled")
 	err = eventlog.Remove(windowsServiceName)
 	if err != nil {
-		log.Error().Msg("Cannot remove event logger")
-		return fmt.Errorf("RemoveEventLogSource() failed: %s", err)
+		return errors.Wrap(err, "Cannot remove event logger")
 	}
 	return nil
 }

@@ -7,19 +7,27 @@ import (
 	"io/ioutil"
 	"net/url"
 	"os"
-	"reflect"
 	"runtime/trace"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/coreos/go-systemd/daemon"
+	"github.com/facebookgo/grace/gracenet"
+	"github.com/getsentry/raven-go"
+	homedir "github.com/mitchellh/go-homedir"
+	"github.com/pkg/errors"
+	"github.com/rs/zerolog"
+	"github.com/urfave/cli/v2"
+	"github.com/urfave/cli/v2/altsrc"
+
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/buildinfo"
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/cliutil"
-	"github.com/cloudflare/cloudflared/cmd/cloudflared/config"
+	"github.com/cloudflare/cloudflared/cmd/cloudflared/proxydns"
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/ui"
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/updater"
+	"github.com/cloudflare/cloudflared/config"
 	"github.com/cloudflare/cloudflared/connection"
-	"github.com/cloudflare/cloudflared/dbconnect"
 	"github.com/cloudflare/cloudflared/ingress"
 	"github.com/cloudflare/cloudflared/logger"
 	"github.com/cloudflare/cloudflared/metrics"
@@ -28,15 +36,6 @@ import (
 	"github.com/cloudflare/cloudflared/tlsconfig"
 	"github.com/cloudflare/cloudflared/tunneldns"
 	"github.com/cloudflare/cloudflared/tunnelstore"
-
-	"github.com/coreos/go-systemd/daemon"
-	"github.com/facebookgo/grace/gracenet"
-	"github.com/getsentry/raven-go"
-	"github.com/mitchellh/go-homedir"
-	"github.com/pkg/errors"
-	"github.com/rs/zerolog"
-	"github.com/urfave/cli/v2"
-	"github.com/urfave/cli/v2/altsrc"
 )
 
 const (
@@ -75,8 +74,8 @@ const (
 	// uiFlag is to enable launching cloudflared in interactive UI mode
 	uiFlag = "ui"
 
-	debugLevelWarning = "At debug level, request URL, method, protocol, content legnth and header will be logged. " +
-		"Response status, content length and header will also be logged in debug level."
+	debugLevelWarning = "At debug level cloudflared will log request URL, method, protocol, content length, as well as, all request and response headers. " +
+		"This can expose sensitive information in your logs."
 
 	LogFieldCommand             = "command"
 	LogFieldExpandedPath        = "expandedPath"
@@ -86,9 +85,12 @@ const (
 )
 
 var (
-	shutdownC      chan struct{}
 	graceShutdownC chan struct{}
 	version        string
+
+	routeFailMsg = fmt.Sprintf("failed to provision routing, please create it manually via Cloudflare dashboard or UI; "+
+		"most likely you already have a conflicting record there. You can also rerun this command with --%s to overwrite "+
+		"any existing DNS records for this hostname.", overwriteDNSFlag)
 )
 
 func Flags() []cli.Flag {
@@ -102,27 +104,27 @@ func Commands() []*cli.Command {
 		buildRouteCommand(),
 		buildRunCommand(),
 		buildListCommand(),
+		buildInfoCommand(),
 		buildIngressSubcommand(),
 		buildDeleteCommand(),
 		buildCleanupCommand(),
 		// for compatibility, allow following as tunnel subcommands
-		tunneldns.Command(true),
-		dbConnectCmd(),
+		proxydns.Command(true),
+		cliutil.RemovedCommand("db-connect"),
 	}
 
 	return []*cli.Command{
 		buildTunnelCommand(subcommands),
 		// for compatibility, allow following as top-level subcommands
 		buildLoginSubcommand(true),
-		dbConnectCmd(),
+		cliutil.RemovedCommand("db-connect"),
 	}
 }
 
 func buildTunnelCommand(subcommands []*cli.Command) *cli.Command {
 	return &cli.Command{
 		Name:      "tunnel",
-		Action:    cliutil.ErrorHandler(TunnelCommand),
-		Before:    SetFlagsFromConfigFile,
+		Action:    cliutil.ConfiguredAction(TunnelCommand),
 		Category:  "Tunnel",
 		Usage:     "Make a locally-running web service accessible over the internet using Argo Tunnel.",
 		ArgsUsage: " ",
@@ -155,25 +157,31 @@ func TunnelCommand(c *cli.Context) error {
 		return err
 	}
 	if name := c.String("name"); name != "" { // Start a named tunnel
-		return runAdhocNamedTunnel(sc, name)
+		return runAdhocNamedTunnel(sc, name, c.String(CredFileFlag))
 	}
 	if ref := config.GetConfiguration().TunnelID; ref != "" {
 		return fmt.Errorf("Use `cloudflared tunnel run` to start tunnel %s", ref)
+	}
+
+	// Unauthenticated named tunnel on <random>.<quick-tunnels-service>.com
+	// For now, default to legacy setup unless quick-service is specified
+	if c.String("hostname") == "" && c.String("quick-service") != "" {
+		return RunQuickTunnel(sc)
 	}
 
 	// Start a classic tunnel
 	return runClassicTunnel(sc)
 }
 
-func Init(v string, s, g chan struct{}) {
-	version, shutdownC, graceShutdownC = v, s, g
+func Init(ver string, gracefulShutdown chan struct{}) {
+	version, graceShutdownC = ver, gracefulShutdown
 }
 
 // runAdhocNamedTunnel create, route and run a named tunnel in one command
-func runAdhocNamedTunnel(sc *subcommandContext, name string) error {
+func runAdhocNamedTunnel(sc *subcommandContext, name, credentialsOutputPath string) error {
 	tunnel, ok, err := sc.tunnelActive(name)
 	if err != nil || !ok {
-		tunnel, err = sc.create(name)
+		tunnel, err = sc.create(name, credentialsOutputPath)
 		if err != nil {
 			return errors.Wrap(err, "failed to create tunnel")
 		}
@@ -183,7 +191,7 @@ func runAdhocNamedTunnel(sc *subcommandContext, name string) error {
 
 	if r, ok := routeFromFlag(sc.c); ok {
 		if res, err := sc.route(tunnel.ID, r); err != nil {
-			sc.log.Err(err).Msg("failed to create route, please create it manually")
+			sc.log.Err(err).Str("route", r.String()).Msg(routeFailMsg)
 		} else {
 			sc.log.Info().Msg(res.SuccessSummary())
 		}
@@ -198,15 +206,15 @@ func runAdhocNamedTunnel(sc *subcommandContext, name string) error {
 
 // runClassicTunnel creates a "classic" non-named tunnel
 func runClassicTunnel(sc *subcommandContext) error {
-	return StartServer(sc.c, version, nil, sc.log, sc.isUIEnabled)
+	return StartServer(sc.c, version, nil, sc.log, sc.isUIEnabled, "")
 }
 
-func routeFromFlag(c *cli.Context) (tunnelstore.Route, bool) {
+func routeFromFlag(c *cli.Context) (route tunnelstore.Route, ok bool) {
 	if hostname := c.String("hostname"); hostname != "" {
 		if lbPool := c.String("lb-pool"); lbPool != "" {
 			return tunnelstore.NewLBRoute(hostname, lbPool), true
 		}
-		return tunnelstore.NewDNSRoute(hostname), true
+		return tunnelstore.NewDNSRoute(hostname, c.Bool(overwriteDNSFlagName)), true
 	}
 	return nil, false
 }
@@ -217,13 +225,12 @@ func StartServer(
 	namedTunnel *connection.NamedTunnelConfig,
 	log *zerolog.Logger,
 	isUIEnabled bool,
+	quickTunnelHostname string,
 ) error {
 	_ = raven.SetDSN(sentryDSN)
 	var wg sync.WaitGroup
 	listeners := gracenet.Net{}
 	errC := make(chan error)
-	connectedSignal := signal.New(make(chan struct{}))
-	dnsReadySignal := make(chan struct{})
 
 	if config.GetConfiguration().Source() == "" {
 		log.Info().Msg(config.ErrNoConfigFile.Error())
@@ -266,47 +273,44 @@ func StartServer(
 	buildInfo.Log(log)
 	logClientOptions(c, log)
 
+	// this context drives the server, when it's cancelled tunnel and all other components (origins, dns, etc...) should stop
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go waitForSignal(graceShutdownC, log)
+
 	if c.IsSet("proxy-dns") {
+		dnsReadySignal := make(chan struct{})
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errC <- runDNSProxyServer(c, dnsReadySignal, shutdownC, log)
+			errC <- runDNSProxyServer(c, dnsReadySignal, ctx.Done(), log)
 		}()
-	} else {
-		close(dnsReadySignal)
+		// Wait for proxy-dns to come up (if used)
+		<-dnsReadySignal
 	}
 
-	// Wait for proxy-dns to come up (if used)
-	<-dnsReadySignal
-
+	connectedSignal := signal.New(make(chan struct{}))
 	go notifySystemd(connectedSignal)
 	if c.IsSet("pidfile") {
 		go writePidFile(connectedSignal, c.String("pidfile"), log)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	// update needs to be after DNS proxy is up to resolve equinox server address
+	wg.Add(1)
 	go func() {
-		<-shutdownC
-		cancel()
+		defer wg.Done()
+		autoupdater := updater.NewAutoUpdater(
+			c.Bool("no-autoupdate"), c.Duration("autoupdate-freq"), &listeners, log,
+		)
+		errC <- autoupdater.Run(ctx)
 	}()
 
-	// update needs to be after DNS proxy is up to resolve equinox server address
-	if updater.IsAutoupdateEnabled(c, log) {
-		autoupdateFreq := c.Duration("autoupdate-freq")
-		log.Info().Dur("autoupdateFreq", autoupdateFreq).Msg("Autoupdate frequency is set")
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			autoupdater := updater.NewAutoUpdater(c.Duration("autoupdate-freq"), &listeners, log)
-			errC <- autoupdater.Run(ctx)
-		}()
-	}
-
 	// Serve DNS proxy stand-alone if no hostname or tag or app is going to run
-	if dnsProxyStandAlone(c) {
+	if dnsProxyStandAlone(c, namedTunnel) {
 		connectedSignal.Notify()
 		// no grace period, handle SIGINT/SIGTERM immediately
-		return waitToShutdown(&wg, errC, shutdownC, graceShutdownC, 0, log)
+		return waitToShutdown(&wg, cancel, errC, graceShutdownC, 0, log)
 	}
 
 	url := c.String("url")
@@ -317,11 +321,11 @@ func StartServer(
 		return fmt.Errorf(errText)
 	}
 
-	transportLog := logger.CreateTransportLoggerFromContext(c, isUIEnabled)
+	logTransport := logger.CreateTransportLoggerFromContext(c, isUIEnabled)
 
-	observer := connection.NewObserver(log, isUIEnabled)
+	observer := connection.NewObserver(log, logTransport, isUIEnabled)
 
-	tunnelConfig, ingressRules, err := prepareTunnelConfig(c, buildInfo, version, log, observer, namedTunnel)
+	tunnelConfig, ingressRules, err := prepareTunnelConfig(c, buildInfo, version, log, logTransport, observer, namedTunnel)
 	if err != nil {
 		log.Err(err).Msg("Couldn't start tunnel")
 		return err
@@ -338,10 +342,10 @@ func StartServer(
 		defer wg.Done()
 		readinessServer := metrics.NewReadyServer(log)
 		observer.RegisterSink(readinessServer)
-		errC <- metrics.ServeMetrics(metricsListener, shutdownC, readinessServer, log)
+		errC <- metrics.ServeMetrics(metricsListener, ctx.Done(), readinessServer, quickTunnelHostname, log)
 	}()
 
-	if err := ingressRules.StartOrigins(&wg, log, shutdownC, errC); err != nil {
+	if err := ingressRules.StartOrigins(&wg, log, ctx.Done(), errC); err != nil {
 		return err
 	}
 
@@ -353,7 +357,10 @@ func StartServer(
 
 	wg.Add(1)
 	go func() {
-		defer wg.Done()
+		defer func() {
+			wg.Done()
+			log.Info().Msg("Tunnel server stopped")
+		}()
 		errC <- origin.StartTunnelDaemon(ctx, tunnelConfig, connectedSignal, reconnectCh, graceShutdownC)
 	}()
 
@@ -365,58 +372,52 @@ func StartServer(
 			&ingressRules,
 			tunnelConfig.HAConnections,
 		)
-		app := tunnelUI.Launch(ctx, log, transportLog)
+		app := tunnelUI.Launch(ctx, log, logTransport)
 		observer.RegisterSink(app)
 	}
 
-	return waitToShutdown(&wg, errC, shutdownC, graceShutdownC, c.Duration("grace-period"), log)
-}
-
-func SetFlagsFromConfigFile(c *cli.Context) error {
-	const exitCode = 1
-	log := logger.CreateLoggerFromContext(c, logger.EnableTerminalLog)
-	inputSource, err := config.ReadConfigFile(c, log)
-	if err != nil {
-		if err == config.ErrNoConfigFile {
-			return nil
-		}
-		return cli.Exit(err, exitCode)
-	}
-	targetFlags := c.Command.Flags
-	if c.Command.Name == "" {
-		targetFlags = c.App.Flags
-	}
-	if err := altsrc.ApplyInputSourceValues(c, inputSource, targetFlags); err != nil {
-		return cli.Exit(err, exitCode)
-	}
-	return nil
+	return waitToShutdown(&wg, cancel, errC, graceShutdownC, c.Duration("grace-period"), log)
 }
 
 func waitToShutdown(wg *sync.WaitGroup,
-	errC chan error,
-	shutdownC, graceShutdownC chan struct{},
+	cancelServerContext func(),
+	errC <-chan error,
+	graceShutdownC <-chan struct{},
 	gracePeriod time.Duration,
 	log *zerolog.Logger,
 ) error {
 	var err error
-	if gracePeriod > 0 {
-		err = waitForSignalWithGraceShutdown(errC, shutdownC, graceShutdownC, gracePeriod, log)
-	} else {
-		err = waitForSignal(errC, shutdownC, log)
-		close(graceShutdownC)
+	select {
+	case err = <-errC:
+		log.Error().Err(err).Msg("Initiating shutdown")
+	case <-graceShutdownC:
+		log.Debug().Msg("Graceful shutdown signalled")
+		if gracePeriod > 0 {
+			// wait for either grace period or service termination
+			select {
+			case <-time.Tick(gracePeriod):
+			case <-errC:
+			}
+		}
 	}
 
-	if err != nil {
-		log.Err(err).Msg("Quitting due to error")
-	} else {
-		log.Info().Msg("Quitting...")
-	}
-	// Wait for clean exit, discarding all errors
+	// stop server context
+	cancelServerContext()
+
+	// Wait for clean exit, discarding all errors while we wait
+	stopDiscarding := make(chan struct{})
 	go func() {
-		for range errC {
+		for {
+			select {
+			case <-errC: // ignore
+			case <-stopDiscarding:
+				return
+			}
 		}
 	}()
 	wg.Wait()
+	close(stopDiscarding)
+
 	return err
 }
 
@@ -466,69 +467,16 @@ func addPortIfMissing(uri *url.URL, port int) string {
 	return fmt.Sprintf("%s:%d", uri.Hostname(), port)
 }
 
-func dbConnectCmd() *cli.Command {
-	cmd := dbconnect.Cmd()
-
-	// Append the tunnel commands so users can customize the daemon settings.
-	cmd.Flags = appendFlags(Flags(), cmd.Flags...)
-
-	// Override before to run tunnel validation before dbconnect validation.
-	cmd.Before = func(c *cli.Context) error {
-		err := SetFlagsFromConfigFile(c)
-		if err == nil {
-			err = dbconnect.CmdBefore(c)
-		}
-		return err
-	}
-
-	// Override action to setup the Proxy, then if successful, start the tunnel daemon.
-	cmd.Action = cliutil.ErrorHandler(func(c *cli.Context) error {
-		err := dbconnect.CmdAction(c)
-		if err == nil {
-			err = TunnelCommand(c)
-		}
-		return err
-	})
-
-	return cmd
-}
-
-// appendFlags will append extra flags to a slice of flags.
-//
-// The cli package will panic if two flags exist with the same name,
-// so if extraFlags contains a flag that was already defined, modify the
-// original flags to use the extra version.
-func appendFlags(flags []cli.Flag, extraFlags ...cli.Flag) []cli.Flag {
-	for _, extra := range extraFlags {
-		var found bool
-
-		// Check if an extra flag overrides an existing flag.
-		for i, flag := range flags {
-			if reflect.DeepEqual(extra.Names(), flag.Names()) {
-				flags[i] = extra
-				found = true
-				break
-			}
-		}
-
-		// Append the extra flag if it has nothing to override.
-		if !found {
-			flags = append(flags, extra)
-		}
-	}
-
-	return flags
-}
-
 func tunnelFlags(shouldHide bool) []cli.Flag {
 	flags := configureCloudflaredFlags(shouldHide)
 	flags = append(flags, configureProxyFlags(shouldHide)...)
 	flags = append(flags, configureLoggingFlags(shouldHide)...)
 	flags = append(flags, configureProxyDNSFlags(shouldHide)...)
 	flags = append(flags, []cli.Flag{
+		credentialsFileFlag,
 		altsrc.NewBoolFlag(&cli.BoolFlag{
 			Name:   "is-autoupdated",
-			Usage:  "Signal the new process that Argo Tunnel client has been autoupdated",
+			Usage:  "Signal the new process that Argo Tunnel connector has been autoupdated",
 			Value:  false,
 			Hidden: true,
 		}),
@@ -628,10 +576,10 @@ func tunnelFlags(shouldHide bool) []cli.Flag {
 		}),
 		altsrc.NewDurationFlag(&cli.DurationFlag{
 			Name:    "grace-period",
-			Usage:   "Duration to accept new requests after cloudflared receives first SIGINT/SIGTERM. A second SIGINT/SIGTERM will force cloudflared to shutdown immediately.",
+			Usage:   "When cloudflared receives SIGINT/SIGTERM it will stop accepting new requests, wait for in-progress requests to terminate, then shutdown. Waiting for in-progress requests will timeout after this grace period, or when a second SIGTERM/SIGINT is received.",
 			Value:   time.Second * 30,
 			EnvVars: []string{"TUNNEL_GRACE_PERIOD"},
-			Hidden:  true,
+			Hidden:  shouldHide,
 		}),
 		// Note TUN-3758 , we use Int because UInt is not supported with altsrc
 		altsrc.NewIntFlag(&cli.IntFlag{
@@ -658,7 +606,7 @@ func tunnelFlags(shouldHide bool) []cli.Flag {
 		altsrc.NewBoolFlag(&cli.BoolFlag{
 			Name:    "stdin-control",
 			Usage:   "Control the process using commands sent through stdin",
-			EnvVars: []string{"STDIN-CONTROL"},
+			EnvVars: []string{"STDIN_CONTROL"},
 			Hidden:  true,
 			Value:   false,
 		}),
@@ -667,6 +615,7 @@ func tunnelFlags(shouldHide bool) []cli.Flag {
 			Aliases: []string{"n"},
 			EnvVars: []string{"TUNNEL_NAME"},
 			Usage:   "Stable name to identify the tunnel. Using this flag will create, route and run a tunnel. For production usage, execute each command separately",
+			Hidden:  shouldHide,
 		}),
 		altsrc.NewBoolFlag(&cli.BoolFlag{
 			Name:   uiFlag,
@@ -674,7 +623,13 @@ func tunnelFlags(shouldHide bool) []cli.Flag {
 			Value:  false,
 			Hidden: shouldHide,
 		}),
+		altsrc.NewStringFlag(&cli.StringFlag{
+			Name:   "quick-service",
+			Usage:  "URL for a service which manages unauthenticated 'quick' tunnels.",
+			Hidden: true,
+		}),
 		selectProtocolFlag,
+		overwriteDNSFlag,
 	}...)
 
 	return flags
@@ -761,7 +716,7 @@ func configureProxyFlags(shouldHide bool) []cli.Flag {
 			Hidden: shouldHide,
 		}),
 		altsrc.NewDurationFlag(&cli.DurationFlag{
-			Name:   ingress.ProxyTCPKeepAlive,
+			Name:   ingress.ProxyTCPKeepAliveFlag,
 			Usage:  "HTTP proxy TCP keepalive duration",
 			Value:  time.Second * 30,
 			Hidden: shouldHide,
@@ -935,7 +890,7 @@ func configureLoggingFlags(shouldHide bool) []cli.Flag {
 		altsrc.NewStringFlag(&cli.StringFlag{
 			Name:    logger.LogLevelFlag,
 			Value:   "info",
-			Usage:   "Application logging level {fatal, error, info, debug}. " + debugLevelWarning,
+			Usage:   "Application logging level {debug, info, warn, error, fatal}. " + debugLevelWarning,
 			EnvVars: []string{"TUNNEL_LOGLEVEL"},
 			Hidden:  shouldHide,
 		}),
@@ -943,7 +898,7 @@ func configureLoggingFlags(shouldHide bool) []cli.Flag {
 			Name:    logger.LogTransportLevelFlag,
 			Aliases: []string{"proto-loglevel"}, // This flag used to be called proto-loglevel
 			Value:   "info",
-			Usage:   "Transport logging level(previously called protocol logging level) {fatal, error, info, debug}",
+			Usage:   "Transport logging level(previously called protocol logging level) {debug, info, warn, error, fatal}",
 			EnvVars: []string{"TUNNEL_PROTO_LOGLEVEL", "TUNNEL_TRANSPORT_LOGLEVEL"},
 			Hidden:  shouldHide,
 		}),
@@ -996,6 +951,13 @@ func configureProxyDNSFlags(shouldHide bool) []cli.Flag {
 			Value:   cli.NewStringSlice("https://1.1.1.1/dns-query", "https://1.0.0.1/dns-query"),
 			EnvVars: []string{"TUNNEL_DNS_UPSTREAM"},
 			Hidden:  shouldHide,
+		}),
+		altsrc.NewIntFlag(&cli.IntFlag{
+			Name:    "proxy-dns-max-upstream-conns",
+			Usage:   "Maximum concurrent connections to upstream. Setting to 0 means unlimited.",
+			Value:   tunneldns.MaxUpstreamConnsDefault,
+			Hidden:  shouldHide,
+			EnvVars: []string{"TUNNEL_DNS_MAX_UPSTREAM_CONNS"},
 		}),
 		altsrc.NewStringSliceFlag(&cli.StringSliceFlag{
 			Name:  "proxy-dns-bootstrap",

@@ -1,3 +1,5 @@
+// +build !windows
+
 package sshgen
 
 import (
@@ -11,13 +13,15 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/cloudflare/cloudflared/cmd/cloudflared/config"
-	cfpath "github.com/cloudflare/cloudflared/cmd/cloudflared/path"
 	"github.com/coreos/go-oidc/jose"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/cloudflare/cloudflared/config"
+	cfpath "github.com/cloudflare/cloudflared/token"
 )
 
 const (
@@ -35,8 +39,9 @@ func TestCertGenSuccess(t *testing.T) {
 	url, _ := url.Parse("https://cf-test-access.com/testpath")
 	token := tokenGenerator()
 
-	fullName, err := cfpath.GenerateAppTokenFilePathFromURL(url, keyName)
+	fullName, err := cfpath.GenerateSSHCertFilePathFromURL(url, keyName)
 	assert.NoError(t, err)
+	assert.True(t, strings.HasSuffix(fullName, "/cf-test-access.com-testpath-cf_key"))
 
 	pubKeyName := fullName + ".pub"
 	certKeyName := fullName + "-cert.pub"

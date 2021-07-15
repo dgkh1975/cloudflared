@@ -4,39 +4,44 @@
 package carrier
 
 import (
+	"crypto/tls"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 
-	"github.com/cloudflare/cloudflared/cmd/cloudflared/token"
-	"github.com/cloudflare/cloudflared/h2mux"
-
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
+
+	"github.com/cloudflare/cloudflared/token"
 )
 
-const LogFieldOriginURL = "originURL"
+const (
+	LogFieldOriginURL       = "originURL"
+	CFAccessTokenHeader     = "Cf-Access-Token"
+	cfJumpDestinationHeader = "Cf-Access-Jump-Destination"
+)
 
 type StartOptions struct {
-	OriginURL string
-	Headers   http.Header
+	AppInfo         *token.AppInfo
+	OriginURL       string
+	Headers         http.Header
+	Host            string
+	TLSClientConfig *tls.Config
 }
 
 // Connection wraps up all the needed functions to forward over the tunnel
 type Connection interface {
 	// ServeStream is used to forward data from the client to the edge
 	ServeStream(*StartOptions, io.ReadWriter) error
-
-	// StartServer is used to listen for incoming connections from the edge to the origin
-	StartServer(net.Listener, string, <-chan struct{}) error
 }
 
 // StdinoutStream is empty struct for wrapping stdin/stdout
 // into a single ReadWriter
-type StdinoutStream struct {
-}
+type StdinoutStream struct{}
 
 // Read will read from Stdin
 func (c *StdinoutStream) Read(p []byte) (int, error) {
@@ -120,7 +125,7 @@ func IsAccessResponse(resp *http.Response) bool {
 	if err != nil || location == nil {
 		return false
 	}
-	if strings.HasPrefix(location.Path, "/cdn-cgi/access/login") {
+	if strings.HasPrefix(location.Path, token.AccessLoginWorkerPath) {
 		return true
 	}
 
@@ -134,7 +139,7 @@ func BuildAccessRequest(options *StartOptions, log *zerolog.Logger) (*http.Reque
 		return nil, err
 	}
 
-	token, err := token.FetchTokenWithRedirect(req.URL, log)
+	token, err := token.FetchTokenWithRedirect(req.URL, options.AppInfo, log)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +150,7 @@ func BuildAccessRequest(options *StartOptions, log *zerolog.Logger) (*http.Reque
 	if err != nil {
 		return nil, err
 	}
-	originRequest.Header.Set(h2mux.CFAccessTokenHeader, token)
+	originRequest.Header.Set(CFAccessTokenHeader, token)
 
 	for k, v := range options.Headers {
 		if len(v) >= 1 {
@@ -154,4 +159,27 @@ func BuildAccessRequest(options *StartOptions, log *zerolog.Logger) (*http.Reque
 	}
 
 	return originRequest, nil
+}
+
+func SetBastionDest(header http.Header, destination string) {
+	if destination != "" {
+		header.Set(cfJumpDestinationHeader, destination)
+	}
+}
+
+func ResolveBastionDest(r *http.Request) (string, error) {
+	jumpDestination := r.Header.Get(cfJumpDestinationHeader)
+	if jumpDestination == "" {
+		return "", fmt.Errorf("Did not receive final destination from client. The --destination flag is likely not set on the client side")
+	}
+	// Strip scheme and path set by client. Without a scheme
+	// Parsing a hostname and path without scheme might not return an error due to parsing ambiguities
+	if jumpURL, err := url.Parse(jumpDestination); err == nil && jumpURL.Host != "" {
+		return removePath(jumpURL.Host), nil
+	}
+	return removePath(jumpDestination), nil
+}
+
+func removePath(dest string) string {
+	return strings.SplitN(dest, "/", 2)[0]
 }
