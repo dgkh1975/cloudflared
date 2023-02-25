@@ -4,10 +4,6 @@ go 1.15
 
 require (
 	github.com/DATA-DOG/go-sqlmock v1.3.3
-	github.com/acmacalister/skittles v0.0.0-20160609003031-7423546701e1 // indirect
-	github.com/alecthomas/units v0.0.0-20190924025748-f65c72e2690d // indirect
-	github.com/anmitsu/go-shlex v0.0.0-20161002113705-648efa622239 // indirect
-	github.com/aws/aws-sdk-go v1.34.19 // indirect
 	github.com/certifi/gocertifi v0.0.0-20200211180108-c7c1fbc02894 // indirect
 	github.com/cloudflare/brotli-go v0.0.0-20191101163834-d34379f7ff93
 	github.com/cloudflare/golibs v0.0.0-20170913112048-333127dbecfc
@@ -24,7 +20,6 @@ require (
 	github.com/fsnotify/fsnotify v1.4.9
 	github.com/gdamore/tcell v1.3.0
 	github.com/getsentry/raven-go v0.0.0-20180517221441-ed7bcb39ff10
-	github.com/gliderlabs/ssh v0.0.0-20191009160644-63518b5243e0 // indirect
 	github.com/go-sql-driver/mysql v1.5.0
 	github.com/gobwas/httphead v0.0.0-20200921212729-da3d93bc3c58 // indirect
 	github.com/gobwas/pool v0.2.1 // indirect
@@ -60,7 +55,7 @@ require (
 	golang.org/x/net v0.0.0-20200904194848-62affa334b73
 	golang.org/x/oauth2 v0.0.0-20200902213428-5d25da1a8d43 // indirect
 	golang.org/x/sync v0.0.0-20200625203802-6e8e738ad208
-	golang.org/x/sys v0.0.0-20210119212857-b64e53b001e4
+	golang.org/x/sys v0.1.0
 	golang.org/x/term v0.0.0-20201210144234-2321bbc49cbf
 	google.golang.org/genproto v0.0.0-20200904004341-0bd0a958aa1d // indirect
 	google.golang.org/grpc v1.32.0 // indirect
