@@ -1,22 +1,27 @@
 package access
 
 import (
+	"crypto/tls"
+	"fmt"
+	"io"
 	"net/http"
 	"strings"
-
-	"github.com/cloudflare/cloudflared/carrier"
-	"github.com/cloudflare/cloudflared/cmd/cloudflared/config"
-	"github.com/cloudflare/cloudflared/h2mux"
-	"github.com/cloudflare/cloudflared/logger"
-	"github.com/cloudflare/cloudflared/validation"
 
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
 	"github.com/urfave/cli/v2"
+
+	"github.com/cloudflare/cloudflared/carrier"
+	"github.com/cloudflare/cloudflared/config"
+	"github.com/cloudflare/cloudflared/logger"
+	"github.com/cloudflare/cloudflared/stream"
+	"github.com/cloudflare/cloudflared/validation"
 )
 
 const (
-	LogFieldHost = "host"
+	LogFieldHost               = "host"
+	cfAccessClientIDHeader     = "Cf-Access-Client-Id"
+	cfAccessClientSecretHeader = "Cf-Access-Client-Secret"
 )
 
 // StartForwarder starts a client side websocket forward
@@ -29,24 +34,24 @@ func StartForwarder(forwarder config.Forwarder, shutdown <-chan struct{}, log *z
 	// get the headers from the config file and add to the request
 	headers := make(http.Header)
 	if forwarder.TokenClientID != "" {
-		headers.Set(h2mux.CFAccessClientIDHeader, forwarder.TokenClientID)
+		headers.Set(cfAccessClientIDHeader, forwarder.TokenClientID)
 	}
 
 	if forwarder.TokenSecret != "" {
-		headers.Set(h2mux.CFAccessClientSecretHeader, forwarder.TokenSecret)
+		headers.Set(cfAccessClientSecretHeader, forwarder.TokenSecret)
 	}
+	headers.Set("User-Agent", userAgent)
 
-	if forwarder.Destination != "" {
-		headers.Add(h2mux.CFJumpDestinationHeader, forwarder.Destination)
-	}
+	carrier.SetBastionDest(headers, forwarder.Destination)
 
 	options := &carrier.StartOptions{
 		OriginURL: forwarder.URL,
 		Headers:   headers, //TODO: TUN-2688 support custom headers from config file
+		IsFedramp: forwarder.IsFedramp,
 	}
 
 	// we could add a cmd line variable for this bool if we want the SOCK5 server to be on the client side
-	wsConn := carrier.NewWSConnection(log, false)
+	wsConn := carrier.NewWSConnection(log)
 
 	log.Info().Str(LogFieldHost, validURL.Host).Msg("Start Websocket listener")
 	return carrier.StartForwarder(wsConn, validURL.Host, shutdown, options)
@@ -57,37 +62,61 @@ func StartForwarder(forwarder config.Forwarder, shutdown <-chan struct{}, log *z
 // useful for proxying other protocols (like ssh) over websockets
 // (which you can put Access in front of)
 func ssh(c *cli.Context) error {
-	log := logger.CreateSSHLoggerFromContext(c, logger.EnableTerminalLog)
+	// If not running as a forwarder, disable terminal logs as it collides with the stdin/stdout of the parent process
+	outputTerminal := logger.DisableTerminalLog
+	if c.IsSet(sshURLFlag) {
+		outputTerminal = logger.EnableTerminalLog
+	}
+	log := logger.CreateSSHLoggerFromContext(c, outputTerminal)
 
 	// get the hostname from the cmdline and error out if its not provided
 	rawHostName := c.String(sshHostnameFlag)
-	hostname, err := validation.ValidateHostname(rawHostName)
-	if err != nil || rawHostName == "" {
+	url, err := parseURL(rawHostName)
+	if err != nil {
+		log.Err(err).Send()
 		return cli.ShowCommandHelp(c, "ssh")
 	}
-	originURL := ensureURLScheme(hostname)
 
 	// get the headers from the cmdline and add them
-	headers := buildRequestHeaders(c.StringSlice(sshHeaderFlag))
+	headers := parseRequestHeaders(c.StringSlice(sshHeaderFlag))
 	if c.IsSet(sshTokenIDFlag) {
-		headers.Set(h2mux.CFAccessClientIDHeader, c.String(sshTokenIDFlag))
+		headers.Set(cfAccessClientIDHeader, c.String(sshTokenIDFlag))
 	}
 	if c.IsSet(sshTokenSecretFlag) {
-		headers.Set(h2mux.CFAccessClientSecretHeader, c.String(sshTokenSecretFlag))
+		headers.Set(cfAccessClientSecretHeader, c.String(sshTokenSecretFlag))
 	}
+	headers.Set("User-Agent", userAgent)
 
-	destination := c.String(sshDestinationFlag)
-	if destination != "" {
-		headers.Add(h2mux.CFJumpDestinationHeader, destination)
-	}
+	carrier.SetBastionDest(headers, c.String(sshDestinationFlag))
 
 	options := &carrier.StartOptions{
-		OriginURL: originURL,
+		OriginURL: url.String(),
 		Headers:   headers,
+		Host:      url.Host,
+		IsFedramp: c.Bool(fedrampFlag),
+	}
+
+	if connectTo := c.String(sshConnectTo); connectTo != "" {
+		parts := strings.Split(connectTo, ":")
+		switch len(parts) {
+		case 1:
+			options.OriginURL = fmt.Sprintf("https://%s", parts[0])
+		case 2:
+			options.OriginURL = fmt.Sprintf("https://%s:%s", parts[0], parts[1])
+		case 3:
+			options.OriginURL = fmt.Sprintf("https://%s:%s", parts[2], parts[1])
+			options.TLSClientConfig = &tls.Config{
+				InsecureSkipVerify: true, // #nosec G402
+				ServerName:         parts[0],
+			}
+			log.Warn().Msgf("Using insecure SSL connection because SNI overridden to %s", parts[0])
+		default:
+			return fmt.Errorf("invalid connection override: %s", connectTo)
+		}
 	}
 
 	// we could add a cmd line variable for this bool if we want the SOCK5 server to be on the client side
-	wsConn := carrier.NewWSConnection(log, false)
+	wsConn := carrier.NewWSConnection(log)
 
 	if c.NArg() > 0 || c.IsSet(sshURLFlag) {
 		forwarder, err := config.ValidateUrl(c, true)
@@ -95,7 +124,6 @@ func ssh(c *cli.Context) error {
 			log.Err(err).Msg("Error validating origin URL")
 			return errors.Wrap(err, "error validating origin URL")
 		}
-
 		log.Info().Str(LogFieldHost, forwarder.Host).Msg("Start Websocket listener")
 		err = carrier.StartForwarder(wsConn, forwarder.Host, shutdownC, options)
 		if err != nil {
@@ -104,16 +132,16 @@ func ssh(c *cli.Context) error {
 		return err
 	}
 
-	return carrier.StartClient(wsConn, &carrier.StdinoutStream{}, options)
-}
-
-func buildRequestHeaders(values []string) http.Header {
-	headers := make(http.Header)
-	for _, valuePair := range values {
-		split := strings.Split(valuePair, ":")
-		if len(split) > 1 {
-			headers.Add(strings.TrimSpace(split[0]), strings.TrimSpace(split[1]))
+	var s io.ReadWriter
+	s = &carrier.StdinoutStream{}
+	if c.IsSet(sshDebugStream) {
+		maxMessages := c.Uint64(sshDebugStream)
+		if maxMessages == 0 {
+			// default to 10 if provided but unset
+			maxMessages = 10
 		}
+		logger := log.With().Str("host", url.Host).Logger()
+		s = stream.NewDebugStream(s, &logger, maxMessages)
 	}
-	return headers
+	return carrier.StartClient(wsConn, s, options)
 }

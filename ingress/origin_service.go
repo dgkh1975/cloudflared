@@ -3,46 +3,58 @@ package ingress
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"strconv"
-	"sync"
 	"time"
 
-	"github.com/cloudflare/cloudflared/hello"
-	"github.com/cloudflare/cloudflared/socks"
-	"github.com/cloudflare/cloudflared/tlsconfig"
-	"github.com/cloudflare/cloudflared/websocket"
-	gws "github.com/gorilla/websocket"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
+
+	"github.com/cloudflare/cloudflared/hello"
+	"github.com/cloudflare/cloudflared/ipaccess"
+	"github.com/cloudflare/cloudflared/management"
+	"github.com/cloudflare/cloudflared/socks"
+	"github.com/cloudflare/cloudflared/tlsconfig"
+)
+
+const (
+	HelloWorldService = "hello_world"
+	HelloWorldFlag    = "hello-world"
+	HttpStatusService = "http_status"
 )
 
 // OriginService is something a tunnel can proxy traffic to.
 type OriginService interface {
-	// RoundTrip is how cloudflared proxies eyeball requests to the actual origin services
-	http.RoundTripper
 	String() string
 	// Start the origin service if it's managed by cloudflared, e.g. proxy servers or Hello World.
 	// If it's not managed by cloudflared, this is a no-op because the user is responsible for
 	// starting the origin service.
-	start(wg *sync.WaitGroup, log *zerolog.Logger, shutdownC <-chan struct{}, errC chan error, cfg OriginRequestConfig) error
+	// Implementor of services managed by cloudflared should terminate the service if shutdownC is closed
+	start(log *zerolog.Logger, shutdownC <-chan struct{}, cfg OriginRequestConfig) error
+	MarshalJSON() ([]byte, error)
 }
 
-// unixSocketPath is an OriginService representing a unix socket (which accepts HTTP)
+// unixSocketPath is an OriginService representing a unix socket (which accepts HTTP or HTTPS)
 type unixSocketPath struct {
 	path      string
+	scheme    string
 	transport *http.Transport
 }
 
 func (o *unixSocketPath) String() string {
-	return "unix socket: " + o.path
+	scheme := ""
+	if o.scheme == "https" {
+		scheme = "+tls"
+	}
+	return fmt.Sprintf("unix%s:%s", scheme, o.path)
 }
 
-func (o *unixSocketPath) start(wg *sync.WaitGroup, log *zerolog.Logger, shutdownC <-chan struct{}, errC chan error, cfg OriginRequestConfig) error {
+func (o *unixSocketPath) start(log *zerolog.Logger, _ <-chan struct{}, cfg OriginRequestConfig) error {
 	transport, err := newHTTPTransport(o, cfg, log)
 	if err != nil {
 		return err
@@ -51,234 +63,273 @@ func (o *unixSocketPath) start(wg *sync.WaitGroup, log *zerolog.Logger, shutdown
 	return nil
 }
 
-func (o *unixSocketPath) RoundTrip(req *http.Request) (*http.Response, error) {
-	return o.transport.RoundTrip(req)
+func (o unixSocketPath) MarshalJSON() ([]byte, error) {
+	return json.Marshal(o.String())
 }
 
-func (o *unixSocketPath) Dial(reqURL *url.URL, headers http.Header) (*gws.Conn, *http.Response, error) {
-	d := &gws.Dialer{
-		NetDial:         o.transport.Dial,
-		NetDialContext:  o.transport.DialContext,
-		TLSClientConfig: o.transport.TLSClientConfig,
-	}
-	reqURL.Scheme = websocket.ChangeRequestScheme(reqURL)
-	return d.Dial(reqURL.String(), headers)
+type httpService struct {
+	url            *url.URL
+	hostHeader     string
+	transport      *http.Transport
+	matchSNIToHost bool
 }
 
-// localService is an OriginService listening on a TCP/IP address the user's origin can route to.
-type localService struct {
-	// The URL for the user's origin service
-	RootURL *url.URL
-	// The URL that cloudflared should send requests to.
-	// If this origin requires starting a proxy, this is the proxy's address,
-	// and that proxy points to RootURL. Otherwise, this is equal to RootURL.
-	URL       *url.URL
-	transport *http.Transport
-}
-
-func (o *localService) Dial(reqURL *url.URL, headers http.Header) (*gws.Conn, *http.Response, error) {
-	d := &gws.Dialer{TLSClientConfig: o.transport.TLSClientConfig}
-	// Rewrite the request URL so that it goes to the origin service.
-	reqURL.Host = o.URL.Host
-	reqURL.Scheme = websocket.ChangeRequestScheme(o.URL)
-	return d.Dial(reqURL.String(), headers)
-}
-
-func (o *localService) start(wg *sync.WaitGroup, log *zerolog.Logger, shutdownC <-chan struct{}, errC chan error, cfg OriginRequestConfig) error {
+func (o *httpService) start(log *zerolog.Logger, _ <-chan struct{}, cfg OriginRequestConfig) error {
 	transport, err := newHTTPTransport(o, cfg, log)
 	if err != nil {
 		return err
 	}
+	o.hostHeader = cfg.HTTPHostHeader
 	o.transport = transport
-
-	// Start a proxy if one is needed
-	if staticHost := o.staticHost(); originRequiresProxy(staticHost, cfg) {
-		if err := o.startProxy(staticHost, wg, log, shutdownC, errC, cfg); err != nil {
-			return err
-		}
-	}
-
+	o.matchSNIToHost = cfg.MatchSNIToHost
 	return nil
 }
 
-func (o *localService) startProxy(staticHost string, wg *sync.WaitGroup, log *zerolog.Logger, shutdownC <-chan struct{}, errC chan error, cfg OriginRequestConfig) error {
+func (o *httpService) String() string {
+	return o.url.String()
+}
 
-	// Start a listener for the proxy
-	proxyAddress := net.JoinHostPort(cfg.ProxyAddress, strconv.Itoa(int(cfg.ProxyPort)))
-	listener, err := net.Listen("tcp", proxyAddress)
-	if err != nil {
-		log.Error().Msgf("Cannot start Websocket Proxy Server: %s", err)
-		return errors.Wrap(err, "Cannot start Websocket Proxy Server")
-	}
+func (o httpService) MarshalJSON() ([]byte, error) {
+	return json.Marshal(o.String())
+}
 
-	// Start the proxy itself
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		streamHandler := websocket.DefaultStreamHandler
-		// This origin's config specifies what type of proxy to start.
-		switch cfg.ProxyType {
-		case socksProxy:
-			log.Info().Msg("SOCKS5 server started")
-			streamHandler = func(wsConn *websocket.Conn, remoteConn net.Conn, _ http.Header) {
-				dialer := socks.NewConnDialer(remoteConn)
-				requestHandler := socks.NewRequestHandler(dialer)
-				socksServer := socks.NewConnectionHandler(requestHandler)
+// rawTCPService dials TCP to the destination specified by the client
+// It's used by warp routing
+type rawTCPService struct {
+	name         string
+	dialer       net.Dialer
+	writeTimeout time.Duration
+	logger       *zerolog.Logger
+}
 
-				_ = socksServer.Serve(wsConn)
-			}
-		case "":
-			log.Debug().Msg("Not starting any websocket proxy")
-		default:
-			log.Error().Msgf("%s isn't a valid proxy (valid options are {%s})", cfg.ProxyType, socksProxy)
-		}
+func (o *rawTCPService) String() string {
+	return o.name
+}
 
-		errC <- websocket.StartProxyServer(log, listener, staticHost, shutdownC, streamHandler)
-	}()
-
-	// Modify this origin, so that it no longer points at the origin service directly.
-	// Instead, it points at the proxy to the origin service.
-	newURL, err := url.Parse("http://" + listener.Addr().String())
-	if err != nil {
-		return err
-	}
-	o.URL = newURL
+func (o *rawTCPService) start(_ *zerolog.Logger, _ <-chan struct{}, _ OriginRequestConfig) error {
 	return nil
 }
 
-func (o *localService) String() string {
-	if o.isBastion() {
-		return "Bastion"
-	}
-	return o.URL.String()
+func (o rawTCPService) MarshalJSON() ([]byte, error) {
+	return json.Marshal(o.String())
 }
 
-func (o *localService) isBastion() bool {
-	return o.URL == nil
+// tcpOverWSService models TCP origins serving eyeballs connecting over websocket, such as
+// cloudflared access commands.
+type tcpOverWSService struct {
+	scheme        string
+	dest          string
+	isBastion     bool
+	streamHandler streamHandlerFunc
+	dialer        net.Dialer
 }
 
-func (o *localService) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Rewrite the request URL so that it goes to the origin service.
-	req.URL.Host = o.URL.Host
-	req.URL.Scheme = o.URL.Scheme
-	return o.transport.RoundTrip(req)
+type socksProxyOverWSService struct {
+	conn *socksProxyOverWSConnection
 }
 
-func (o *localService) staticHost() string {
-
-	if o.URL == nil {
-		return ""
-	}
-
-	addPortIfMissing := func(uri *url.URL, port int) string {
-		if uri.Port() != "" {
-			return uri.Host
-		}
-		return fmt.Sprintf("%s:%d", uri.Hostname(), port)
-	}
-
-	switch o.URL.Scheme {
+func newTCPOverWSService(url *url.URL) *tcpOverWSService {
+	switch url.Scheme {
 	case "ssh":
-		return addPortIfMissing(o.URL, 22)
+		addPortIfMissing(url, 22)
 	case "rdp":
-		return addPortIfMissing(o.URL, 3389)
+		addPortIfMissing(url, 3389)
 	case "smb":
-		return addPortIfMissing(o.URL, 445)
+		addPortIfMissing(url, 445)
 	case "tcp":
-		return addPortIfMissing(o.URL, 7864) // just a random port since there isn't a default in this case
+		addPortIfMissing(url, 7864) // just a random port since there isn't a default in this case
 	}
-	return ""
+	return &tcpOverWSService{
+		scheme: url.Scheme,
+		dest:   url.Host,
+	}
+}
 
+func newBastionService() *tcpOverWSService {
+	return &tcpOverWSService{
+		isBastion: true,
+	}
+}
+
+func newSocksProxyOverWSService(accessPolicy *ipaccess.Policy) *socksProxyOverWSService {
+	proxy := socksProxyOverWSService{
+		conn: &socksProxyOverWSConnection{
+			accessPolicy: accessPolicy,
+		},
+	}
+
+	return &proxy
+}
+
+func addPortIfMissing(uri *url.URL, port int) {
+	hostname := uri.Hostname()
+
+	if uri.Port() == "" {
+		uri.Host = net.JoinHostPort(hostname, strconv.FormatInt(int64(port), 10))
+	}
+}
+
+func (o *tcpOverWSService) String() string {
+	if o.isBastion {
+		return ServiceBastion
+	}
+
+	if o.scheme != "" {
+		return fmt.Sprintf("%s://%s", o.scheme, o.dest)
+	} else {
+		return o.dest
+	}
+}
+
+func (o *tcpOverWSService) start(log *zerolog.Logger, _ <-chan struct{}, cfg OriginRequestConfig) error {
+	if cfg.ProxyType == socksProxy {
+		o.streamHandler = socks.StreamHandler
+	} else {
+		o.streamHandler = DefaultStreamHandler
+	}
+	o.dialer.Timeout = cfg.ConnectTimeout.Duration
+	o.dialer.KeepAlive = cfg.TCPKeepAlive.Duration
+	return nil
+}
+
+func (o tcpOverWSService) MarshalJSON() ([]byte, error) {
+	return json.Marshal(o.String())
+}
+
+func (o *socksProxyOverWSService) start(log *zerolog.Logger, _ <-chan struct{}, cfg OriginRequestConfig) error {
+	return nil
+}
+
+func (o *socksProxyOverWSService) String() string {
+	return ServiceSocksProxy
+}
+
+func (o socksProxyOverWSService) MarshalJSON() ([]byte, error) {
+	return json.Marshal(o.String())
 }
 
 // HelloWorld is an OriginService for the built-in Hello World server.
 // Users only use this for testing and experimenting with cloudflared.
 type helloWorld struct {
-	server    net.Listener
-	transport *http.Transport
+	httpService
+	server net.Listener
 }
 
 func (o *helloWorld) String() string {
-	return "Hello World test origin"
+	return HelloWorldService
 }
 
 // Start starts a HelloWorld server and stores its address in the Service receiver.
 func (o *helloWorld) start(
-	wg *sync.WaitGroup,
 	log *zerolog.Logger,
 	shutdownC <-chan struct{},
-	errC chan error,
 	cfg OriginRequestConfig,
 ) error {
-	transport, err := newHTTPTransport(o, cfg, log)
-	if err != nil {
+	if err := o.httpService.start(log, shutdownC, cfg); err != nil {
 		return err
 	}
-	o.transport = transport
+
 	helloListener, err := hello.CreateTLSListener("127.0.0.1:")
 	if err != nil {
 		return errors.Wrap(err, "Cannot start Hello World Server")
 	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		_ = hello.StartHelloWorldServer(log, helloListener, shutdownC)
-	}()
+	go hello.StartHelloWorldServer(log, helloListener, shutdownC)
 	o.server = helloListener
+
+	o.httpService.url = &url.URL{
+		Scheme: "https",
+		Host:   o.server.Addr().String(),
+	}
+
 	return nil
 }
 
-func (o *helloWorld) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Rewrite the request URL so that it goes to the Hello World server.
-	req.URL.Host = o.server.Addr().String()
-	req.URL.Scheme = "https"
-	return o.transport.RoundTrip(req)
-}
-
-func (o *helloWorld) Dial(reqURL *url.URL, headers http.Header) (*gws.Conn, *http.Response, error) {
-	d := &gws.Dialer{
-		TLSClientConfig: o.transport.TLSClientConfig,
-	}
-	reqURL.Host = o.server.Addr().String()
-	reqURL.Scheme = "wss"
-	return d.Dial(reqURL.String(), headers)
-}
-
-func originRequiresProxy(staticHost string, cfg OriginRequestConfig) bool {
-	return staticHost != "" || cfg.BastionMode
+func (o helloWorld) MarshalJSON() ([]byte, error) {
+	return json.Marshal(o.String())
 }
 
 // statusCode is an OriginService that just responds with a given HTTP status.
 // Typical use-case is "user wants the catch-all rule to just respond 404".
 type statusCode struct {
-	resp *http.Response
+	code int
+
+	// Set only when the user has not defined any ingress rules
+	defaultResp bool
+	log         *zerolog.Logger
 }
 
 func newStatusCode(status int) statusCode {
-	resp := &http.Response{
-		StatusCode: status,
-		Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
-		Body:       new(NopReadCloser),
-	}
-	return statusCode{resp: resp}
+	return statusCode{code: status}
+}
+
+// default status code (503) that is returned for requests to cloudflared that don't have any ingress rules setup
+func newDefaultStatusCode(log *zerolog.Logger) statusCode {
+	return statusCode{code: 503, defaultResp: true, log: log}
 }
 
 func (o *statusCode) String() string {
-	return fmt.Sprintf("HTTP %d", o.resp.StatusCode)
+	return fmt.Sprintf("http_status:%d", o.code)
 }
 
 func (o *statusCode) start(
-	wg *sync.WaitGroup,
 	log *zerolog.Logger,
-	shutdownC <-chan struct{},
-	errC chan error,
+	_ <-chan struct{},
 	cfg OriginRequestConfig,
 ) error {
 	return nil
 }
 
-func (o *statusCode) RoundTrip(_ *http.Request) (*http.Response, error) {
-	return o.resp, nil
+func (o statusCode) MarshalJSON() ([]byte, error) {
+	return json.Marshal(o.String())
+}
+
+// WarpRoutingService starts a tcp stream between the origin and requests from
+// warp clients.
+type WarpRoutingService struct {
+	Proxy StreamBasedOriginProxy
+}
+
+func NewWarpRoutingService(config WarpRoutingConfig, writeTimeout time.Duration) *WarpRoutingService {
+	svc := &rawTCPService{
+		name: ServiceWarpRouting,
+		dialer: net.Dialer{
+			Timeout:   config.ConnectTimeout.Duration,
+			KeepAlive: config.TCPKeepAlive.Duration,
+		},
+		writeTimeout: writeTimeout,
+	}
+
+	return &WarpRoutingService{Proxy: svc}
+}
+
+// ManagementService starts a local HTTP server to handle incoming management requests.
+type ManagementService struct {
+	HTTPLocalProxy
+}
+
+func newManagementService(managementProxy HTTPLocalProxy) *ManagementService {
+	return &ManagementService{
+		HTTPLocalProxy: managementProxy,
+	}
+}
+
+func (o *ManagementService) start(log *zerolog.Logger, _ <-chan struct{}, cfg OriginRequestConfig) error {
+	return nil
+}
+
+func (o *ManagementService) String() string {
+	return "management"
+}
+
+func (o ManagementService) MarshalJSON() ([]byte, error) {
+	return json.Marshal(o.String())
+}
+
+func NewManagementRule(management *management.ManagementService) Rule {
+	return Rule{
+		Hostname: management.Hostname,
+		Service:  newManagementService(management),
+	}
 }
 
 type NopReadCloser struct{}
@@ -302,18 +353,19 @@ func newHTTPTransport(service OriginService, cfg OriginRequestConfig, log *zerol
 		Proxy:                 http.ProxyFromEnvironment,
 		MaxIdleConns:          cfg.KeepAliveConnections,
 		MaxIdleConnsPerHost:   cfg.KeepAliveConnections,
-		IdleConnTimeout:       cfg.KeepAliveTimeout,
-		TLSHandshakeTimeout:   cfg.TLSTimeout,
+		IdleConnTimeout:       cfg.KeepAliveTimeout.Duration,
+		TLSHandshakeTimeout:   cfg.TLSTimeout.Duration,
 		ExpectContinueTimeout: 1 * time.Second,
 		TLSClientConfig:       &tls.Config{RootCAs: originCertPool, InsecureSkipVerify: cfg.NoTLSVerify},
+		ForceAttemptHTTP2:     cfg.Http2Origin,
 	}
 	if _, isHelloWorld := service.(*helloWorld); !isHelloWorld && cfg.OriginServerName != "" {
 		httpTransport.TLSClientConfig.ServerName = cfg.OriginServerName
 	}
 
 	dialer := &net.Dialer{
-		Timeout:   cfg.ConnectTimeout,
-		KeepAlive: cfg.TCPKeepAlive,
+		Timeout:   cfg.ConnectTimeout.Duration,
+		KeepAlive: cfg.TCPKeepAlive.Duration,
 	}
 	if cfg.NoHappyEyeballs {
 		dialer.FallbackDelay = -1 // As of Golang 1.12, a negative delay disables "happy eyeballs"
@@ -337,19 +389,23 @@ func newHTTPTransport(service OriginService, cfg OriginRequestConfig, log *zerol
 	return &httpTransport, nil
 }
 
-// MockOriginService should only be used by other packages to mock OriginService. Set Transport to configure desired RoundTripper behavior.
-type MockOriginService struct {
+// MockOriginHTTPService should only be used by other packages to mock OriginService. Set Transport to configure desired RoundTripper behavior.
+type MockOriginHTTPService struct {
 	Transport http.RoundTripper
 }
 
-func (mos MockOriginService) RoundTrip(req *http.Request) (*http.Response, error) {
+func (mos MockOriginHTTPService) RoundTrip(req *http.Request) (*http.Response, error) {
 	return mos.Transport.RoundTrip(req)
 }
 
-func (mos MockOriginService) String() string {
+func (mos MockOriginHTTPService) String() string {
 	return "MockOriginService"
 }
 
-func (mos MockOriginService) start(wg *sync.WaitGroup, log *zerolog.Logger, shutdownC <-chan struct{}, errC chan error, cfg OriginRequestConfig) error {
+func (mos MockOriginHTTPService) start(log *zerolog.Logger, _ <-chan struct{}, cfg OriginRequestConfig) error {
 	return nil
+}
+
+func (mos MockOriginHTTPService) MarshalJSON() ([]byte, error) {
+	return json.Marshal(mos.String())
 }

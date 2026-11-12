@@ -1,3 +1,5 @@
+//go:build !windows
+
 package sshgen
 
 import (
@@ -6,18 +8,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/cloudflare/cloudflared/cmd/cloudflared/config"
-	cfpath "github.com/cloudflare/cloudflared/cmd/cloudflared/path"
-	"github.com/coreos/go-oidc/jose"
+	"github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/cloudflare/cloudflared/config"
+	cfpath "github.com/cloudflare/cloudflared/token"
 )
 
 const (
@@ -35,8 +39,9 @@ func TestCertGenSuccess(t *testing.T) {
 	url, _ := url.Parse("https://cf-test-access.com/testpath")
 	token := tokenGenerator()
 
-	fullName, err := cfpath.GenerateAppTokenFilePathFromURL(url, keyName)
+	fullName, err := cfpath.GenerateSSHCertFilePathFromURL(url, keyName)
 	assert.NoError(t, err)
+	assert.True(t, strings.HasSuffix(fullName, "/cf-test-access.com-testpath-cf_key"))
 
 	pubKeyName := fullName + ".pub"
 	certKeyName := fullName + "-cert.pub"
@@ -59,7 +64,7 @@ func TestCertGenSuccess(t *testing.T) {
 	mockRequest = func(url, contentType string, body io.Reader) (*http.Response, error) {
 		assert.Contains(t, "/cdn-cgi/access/cert_sign", url)
 		assert.Equal(t, "application/json", contentType)
-		buf, err := ioutil.ReadAll(body)
+		buf, err := io.ReadAll(body)
 		assert.NoError(t, err)
 		assert.NotEmpty(t, buf)
 		return w.Result(), nil
@@ -91,22 +96,28 @@ func TestCertGenSuccess(t *testing.T) {
 }
 
 func tokenGenerator() string {
-	iat := time.Now().Unix()
-	exp := time.Now().Add(time.Minute * 5).Unix()
-	claims := jose.Claims{}
-	claims.Add("aud", audTest)
-	claims.Add("iat", iat)
-	claims.Add("nonce", nonceTest)
-	claims.Add("exp", exp)
+	iat := time.Now()
+	exp := time.Now().Add(time.Minute * 5)
 
-	k, err := rsa.GenerateKey(rand.Reader, 512)
+	claims := jwt.Claims{
+		Audience: jwt.Audience{audTest},
+		IssuedAt: jwt.NewNumericDate(iat),
+		Expiry:   jwt.NewNumericDate(exp),
+	}
+
+	key, err := rsa.GenerateKey(rand.Reader, 4096)
 	if err != nil {
-		return ""
+		panic(err)
 	}
-	signer := jose.NewSignerRSA("asdf", *k)
-	token, terr := jose.NewSignedJWT(claims, signer)
-	if terr != nil {
-		return ""
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: key}, (&jose.SignerOptions{}).WithType("JWT"))
+	if err != nil {
+		panic(err)
 	}
-	return token.Encode()
+
+	signedToken, err := jwt.Signed(signer).Claims(claims).Serialize()
+	if err != nil {
+		panic(err)
+	}
+
+	return signedToken
 }

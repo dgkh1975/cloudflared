@@ -1,14 +1,14 @@
 package main
 
 import (
-	"github.com/cloudflare/cloudflared/cmd/cloudflared/config"
-	"github.com/cloudflare/cloudflared/overwatch"
-
 	"github.com/rs/zerolog"
+
+	"github.com/cloudflare/cloudflared/config"
+	"github.com/cloudflare/cloudflared/overwatch"
 )
 
 // AppService is the main service that runs when no command lines flags are passed to cloudflared
-// it manages all the running services such as tunnels, forwarders, DNS resolver, etc
+// it manages all the running services such as tunnels, forwarders, etc
 type AppService struct {
 	configManager    config.Manager
 	serviceManager   overwatch.Manager
@@ -71,14 +71,6 @@ func (s *AppService) handleConfigUpdate(c config.Root) {
 		service := NewForwardService(f, s.log)
 		s.serviceManager.Add(service)
 		activeServices[service.Name()] = struct{}{}
-	}
-
-	// handle resolver changes
-	if c.Resolver.Enabled {
-		service := NewResolverService(c.Resolver, s.log)
-		s.serviceManager.Add(service)
-		activeServices[service.Name()] = struct{}{}
-
 	}
 
 	// TODO: TUN-1451 - tunnels

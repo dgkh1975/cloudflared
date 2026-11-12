@@ -2,9 +2,11 @@ package tunnel
 
 import (
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -19,17 +21,34 @@ import (
 	"github.com/urfave/cli/v2"
 	"github.com/urfave/cli/v2/altsrc"
 	"golang.org/x/net/idna"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 
+	"github.com/cloudflare/cloudflared/cfapi"
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/cliutil"
-	"github.com/cloudflare/cloudflared/cmd/cloudflared/config"
+	"github.com/cloudflare/cloudflared/cmd/cloudflared/flags"
+	"github.com/cloudflare/cloudflared/cmd/cloudflared/updater"
+	"github.com/cloudflare/cloudflared/config"
 	"github.com/cloudflare/cloudflared/connection"
-	"github.com/cloudflare/cloudflared/tunnelstore"
+	"github.com/cloudflare/cloudflared/diagnostic"
+	"github.com/cloudflare/cloudflared/metrics"
 )
 
 const (
-	CredFileFlagAlias = "cred-file"
-	CredFileFlag      = "credentials-file"
+	allSortByOptions        = "name, id, createdAt, deletedAt, numConnections"
+	connsSortByOptions      = "id, startedAt, numConnections, version"
+	CredFileFlagAlias       = "cred-file"
+	CredFileFlag            = "credentials-file"
+	CredContentsFlag        = "credentials-contents"
+	TunnelTokenFlag         = "token"
+	TunnelTokenFileFlag     = "token-file"
+	overwriteDNSFlagName    = "overwrite-dns"
+	noDiagLogsFlagName      = "no-diag-logs"
+	noDiagMetricsFlagName   = "no-diag-metrics"
+	noDiagSystemFlagName    = "no-diag-system"
+	noDiagRuntimeFlagName   = "no-diag-runtime"
+	noDiagNetworkFlagName   = "no-diag-network"
+	diagContainerIDFlagName = "diag-container-id"
+	diagPodFlagName         = "diag-pod-id"
 
 	LogFieldTunnelID = "tunnelID"
 )
@@ -41,16 +60,26 @@ var (
 		Usage:   "Include deleted tunnels in the list",
 	}
 	listNameFlag = &cli.StringFlag{
-		Name:    "name",
+		Name:    flags.Name,
 		Aliases: []string{"n"},
 		Usage:   "List tunnels with the given `NAME`",
+	}
+	listNamePrefixFlag = &cli.StringFlag{
+		Name:    "name-prefix",
+		Aliases: []string{"np"},
+		Usage:   "List tunnels that start with the give `NAME` prefix",
+	}
+	listExcludeNamePrefixFlag = &cli.StringFlag{
+		Name:    "exclude-name-prefix",
+		Aliases: []string{"enp"},
+		Usage:   "List tunnels whose `NAME` does not start with the given prefix",
 	}
 	listExistedAtFlag = &cli.TimestampFlag{
 		Name:        "when",
 		Aliases:     []string{"w"},
 		Usage:       "List tunnels that are active at the given `TIME` in RFC3339 format",
-		Layout:      tunnelstore.TimeLayout,
-		DefaultText: fmt.Sprintf("current time, %s", time.Now().Format(tunnelstore.TimeLayout)),
+		Layout:      cfapi.TimeLayout,
+		DefaultText: fmt.Sprintf("current time, %s", time.Now().Format(cfapi.TimeLayout)),
 	}
 	listIDFlag = &cli.StringFlag{
 		Name:    "id",
@@ -62,45 +91,165 @@ var (
 		Aliases: []string{"rd"},
 		Usage:   "Include connections that have recently disconnected in the list",
 	}
-	outputFormatFlag = altsrc.NewStringFlag(&cli.StringFlag{
+	outputFormatFlag = &cli.StringFlag{
 		Name:    "output",
 		Aliases: []string{"o"},
 		Usage:   "Render output using given `FORMAT`. Valid options are 'json' or 'yaml'",
+	}
+	sortByFlag = &cli.StringFlag{
+		Name:    "sort-by",
+		Value:   "name",
+		Usage:   fmt.Sprintf("Sorts the list of tunnels by the given field. Valid options are {%s}", allSortByOptions),
+		EnvVars: []string{"TUNNEL_LIST_SORT_BY"},
+	}
+	invertSortFlag = &cli.BoolFlag{
+		Name:    "invert-sort",
+		Usage:   "Inverts the sort order of the tunnel list.",
+		EnvVars: []string{"TUNNEL_LIST_INVERT_SORT"},
+	}
+	featuresFlag = altsrc.NewStringSliceFlag(&cli.StringSliceFlag{
+		Name:    flags.Features,
+		Aliases: []string{"F"},
+		Usage:   "Opt into various features that are still being developed or tested.",
 	})
-	forceFlag = altsrc.NewBoolFlag(&cli.BoolFlag{
-		Name:    "force",
-		Aliases: []string{"f"},
-		Usage: "By default, if a tunnel is currently being run from a cloudflared, you can't " +
-			"simultaneously rerun it again from a second cloudflared. The --force flag lets you " +
-			"overwrite the previous tunnel. If you want to use a single hostname with multiple " +
-			"tunnels, you can do so with Cloudflare's Load Balancer product.",
-	})
-	credentialsFileFlag = altsrc.NewStringFlag(&cli.StringFlag{
+	credentialsFileFlagCLIOnly = &cli.StringFlag{
 		Name:    CredFileFlag,
 		Aliases: []string{CredFileFlagAlias},
-		Usage:   "File path of tunnel credentials",
+		Usage:   "Filepath at which to read/write the tunnel credentials",
 		EnvVars: []string{"TUNNEL_CRED_FILE"},
+	}
+	credentialsFileFlag     = altsrc.NewStringFlag(credentialsFileFlagCLIOnly)
+	credentialsContentsFlag = altsrc.NewStringFlag(&cli.StringFlag{
+		Name:    CredContentsFlag,
+		Usage:   "Contents of the tunnel credentials JSON file to use. When provided along with credentials-file, this will take precedence.",
+		EnvVars: []string{"TUNNEL_CRED_CONTENTS"},
+	})
+	tunnelTokenFlag = altsrc.NewStringFlag(&cli.StringFlag{
+		Name:    TunnelTokenFlag,
+		Usage:   "The Tunnel token. When provided along with credentials, this will take precedence. Also takes precedence over token-file",
+		EnvVars: []string{"TUNNEL_TOKEN"},
+	})
+	tunnelTokenFileFlag = altsrc.NewStringFlag(&cli.StringFlag{
+		Name:    TunnelTokenFileFlag,
+		Usage:   "Filepath at which to read the tunnel token. When provided along with credentials, this will take precedence.",
+		EnvVars: []string{"TUNNEL_TOKEN_FILE"},
 	})
 	forceDeleteFlag = &cli.BoolFlag{
-		Name:    "force",
+		Name:    flags.Force,
 		Aliases: []string{"f"},
-		Usage:   "Allows you to delete a tunnel, even if it has active connections.",
+		Usage: "Deletes a tunnel even if tunnel is connected and it has dependencies associated to it. (eg. IP routes)." +
+			" It is not possible to delete tunnels that have connections or non-deleted dependencies, without this flag.",
 		EnvVars: []string{"TUNNEL_RUN_FORCE_OVERWRITE"},
 	}
 	selectProtocolFlag = altsrc.NewStringFlag(&cli.StringFlag{
-		Name:    "protocol",
-		Value:   "h2mux",
+		Name:    flags.Protocol,
+		Value:   connection.AutoSelectFlag,
 		Aliases: []string{"p"},
 		Usage:   fmt.Sprintf("Protocol implementation to connect with Cloudflare's edge network. %s", connection.AvailableProtocolFlagMessage),
 		EnvVars: []string{"TUNNEL_TRANSPORT_PROTOCOL"},
 		Hidden:  true,
 	})
+	postQuantumFlag = altsrc.NewBoolFlag(&cli.BoolFlag{
+		Name:    flags.PostQuantum,
+		Usage:   "When given creates an experimental post-quantum secure tunnel",
+		Aliases: []string{"pq"},
+		EnvVars: []string{"TUNNEL_POST_QUANTUM"},
+	})
+	sortInfoByFlag = &cli.StringFlag{
+		Name:    "sort-by",
+		Value:   "createdAt",
+		Usage:   fmt.Sprintf("Sorts the list of connections of a tunnel by the given field. Valid options are {%s}", connsSortByOptions),
+		EnvVars: []string{"TUNNEL_INFO_SORT_BY"},
+	}
+	invertInfoSortFlag = &cli.BoolFlag{
+		Name:    "invert-sort",
+		Usage:   "Inverts the sort order of the tunnel info.",
+		EnvVars: []string{"TUNNEL_INFO_INVERT_SORT"},
+	}
+	cleanupClientFlag = &cli.StringFlag{
+		Name:    "connector-id",
+		Aliases: []string{"c"},
+		Usage:   `Constraints the cleanup to stop the connections of a single Connector (by its ID). You can find the various Connectors (and their IDs) currently connected to your tunnel via 'cloudflared tunnel info <name>'.`,
+		EnvVars: []string{"TUNNEL_CLEANUP_CONNECTOR"},
+	}
+	overwriteDNSFlag = &cli.BoolFlag{
+		Name:    overwriteDNSFlagName,
+		Aliases: []string{"f"},
+		Usage:   `Overwrites existing DNS records with this hostname`,
+		EnvVars: []string{"TUNNEL_FORCE_PROVISIONING_DNS"},
+	}
+	createSecretFlag = &cli.StringFlag{
+		Name:    "secret",
+		Aliases: []string{"s"},
+		Usage:   "Base64 encoded secret to set for the tunnel. The decoded secret must be at least 32 bytes long. If not specified, a random 32-byte secret will be generated.",
+		EnvVars: []string{"TUNNEL_CREATE_SECRET"},
+	}
+	icmpv4SrcFlag = &cli.StringFlag{
+		Name:    flags.ICMPV4Src,
+		Usage:   "Source address to send/receive ICMPv4 messages. If not provided cloudflared will dial a local address to determine the source IP or fallback to 0.0.0.0.",
+		EnvVars: []string{"TUNNEL_ICMPV4_SRC"},
+	}
+	icmpv6SrcFlag = &cli.StringFlag{
+		Name:    flags.ICMPV6Src,
+		Usage:   "Source address and the interface name to send/receive ICMPv6 messages. If not provided cloudflared will dial a local address to determine the source IP or fallback to ::.",
+		EnvVars: []string{"TUNNEL_ICMPV6_SRC"},
+	}
+	metricsFlag = &cli.StringFlag{
+		Name:  flags.Metrics,
+		Usage: "The metrics server address i.e.: 127.0.0.1:12345. If your instance is running in a Docker/Kubernetes environment you need to setup port forwarding for your application.",
+		Value: "",
+	}
+	diagContainerFlag = &cli.StringFlag{
+		Name:  diagContainerIDFlagName,
+		Usage: "Container ID or Name to collect logs from",
+		Value: "",
+	}
+	diagPodFlag = &cli.StringFlag{
+		Name:  diagPodFlagName,
+		Usage: "Kubernetes POD to collect logs from",
+		Value: "",
+	}
+	noDiagLogsFlag = &cli.BoolFlag{
+		Name:  noDiagLogsFlagName,
+		Usage: "Log collection will not be performed",
+		Value: false,
+	}
+	noDiagMetricsFlag = &cli.BoolFlag{
+		Name:  noDiagMetricsFlagName,
+		Usage: "Metric collection will not be performed",
+		Value: false,
+	}
+	noDiagSystemFlag = &cli.BoolFlag{
+		Name:  noDiagSystemFlagName,
+		Usage: "System information collection will not be performed",
+		Value: false,
+	}
+	noDiagRuntimeFlag = &cli.BoolFlag{
+		Name:  noDiagRuntimeFlagName,
+		Usage: "Runtime information collection will not be performed",
+		Value: false,
+	}
+	noDiagNetworkFlag = &cli.BoolFlag{
+		Name:  noDiagNetworkFlagName,
+		Usage: "Network diagnostics won't be performed",
+		Value: false,
+	}
+	maxActiveFlowsFlag = &cli.Uint64Flag{
+		Name:    flags.MaxActiveFlows,
+		Usage:   "Overrides the remote configuration for max active private network flows (TCP/UDP) that this cloudflared instance supports",
+		EnvVars: []string{"TUNNEL_MAX_ACTIVE_FLOWS"},
+	}
+	dnsResolverAddrsFlag = &cli.StringSliceFlag{
+		Name:    flags.VirtualDNSServiceResolverAddresses,
+		Usage:   "Overrides the dynamic DNS resolver resolution to use these address:port's instead.",
+		EnvVars: []string{"TUNNEL_DNS_RESOLVER_ADDRS"},
+	}
 )
 
 func buildCreateCommand() *cli.Command {
 	return &cli.Command{
 		Name:      "create",
-		Action:    cliutil.ErrorHandler(createCommand),
+		Action:    cliutil.ConfiguredAction(createCommand),
 		Usage:     "Create a new tunnel with given name",
 		UsageText: "cloudflared tunnel [tunnel command options] create [subcommand options] NAME",
 		Description: `Creates a tunnel, registers it with Cloudflare edge and generates credential file used to run this tunnel.
@@ -109,7 +258,7 @@ func buildCreateCommand() *cli.Command {
   For example, to create a tunnel named 'my-tunnel' run:
 
   $ cloudflared tunnel create my-tunnel`,
-		Flags:              []cli.Flag{outputFormatFlag},
+		Flags:              []cli.Flag{outputFormatFlag, credentialsFileFlagCLIOnly, createSecretFlag},
 		CustomHelpTemplate: commandHelpTemplate(),
 	}
 }
@@ -132,7 +281,10 @@ func createCommand(c *cli.Context) error {
 	}
 	name := c.Args().First()
 
-	_, err = sc.create(name)
+	warningChecker := updater.StartWarningCheck(c)
+	defer warningChecker.LogWarningIfAny(sc.log)
+
+	_, err = sc.create(name, c.String(CredFileFlag), c.String(createSecretFlag.Name))
 	return errors.Wrap(err, "failed to create tunnel")
 }
 
@@ -142,31 +294,41 @@ func tunnelFilePath(tunnelID uuid.UUID, directory string) (string, error) {
 	return homedir.Expand(filePath)
 }
 
-func writeTunnelCredentials(
-	originCertPath string,
-	credentials *connection.Credentials,
-) (filePath string, err error) {
-	originCertDir := filepath.Dir(originCertPath)
-	filePath, err = tunnelFilePath(credentials.TunnelID, originCertDir)
-	if err != nil {
-		return "", err
+// writeTunnelCredentials saves `credentials` as a JSON into `filePath`, only if
+// the file does not exist already
+func writeTunnelCredentials(filePath string, credentials *connection.Credentials) error {
+	if _, err := os.Stat(filePath); !os.IsNotExist(err) {
+		if err == nil {
+			return fmt.Errorf("%s already exists", filePath)
+		}
+		return err
 	}
-	// Write the name and ID to the file too
 	body, err := json.Marshal(credentials)
 	if err != nil {
-		return "", errors.Wrap(err, "Unable to marshal tunnel credentials to JSON")
+		return errors.Wrap(err, "Unable to marshal tunnel credentials to JSON")
 	}
-	return filePath, ioutil.WriteFile(filePath, body, 400)
+	return os.WriteFile(filePath, body, 0400)
 }
 
 func buildListCommand() *cli.Command {
 	return &cli.Command{
-		Name:               "list",
-		Action:             cliutil.ErrorHandler(listCommand),
-		Usage:              "List existing tunnels",
-		UsageText:          "cloudflared tunnel [tunnel command options] list [subcommand options]",
-		Description:        "cloudflared tunnel list will display all active tunnels, their created time and associated connections. Use -d flag to include deleted tunnels. See the list of options to filter the list",
-		Flags:              []cli.Flag{outputFormatFlag, showDeletedFlag, listNameFlag, listExistedAtFlag, listIDFlag, showRecentlyDisconnected},
+		Name:        "list",
+		Action:      cliutil.ConfiguredAction(listCommand),
+		Usage:       "List existing tunnels",
+		UsageText:   "cloudflared tunnel [tunnel command options] list [subcommand options]",
+		Description: "cloudflared tunnel list will display all active tunnels, their created time and associated connections. Use -d flag to include deleted tunnels. See the list of options to filter the list",
+		Flags: []cli.Flag{
+			outputFormatFlag,
+			showDeletedFlag,
+			listNameFlag,
+			listNamePrefixFlag,
+			listExcludeNamePrefixFlag,
+			listExistedAtFlag,
+			listIDFlag,
+			showRecentlyDisconnected,
+			sortByFlag,
+			invertSortFlag,
+		},
 		CustomHelpTemplate: commandHelpTemplate(),
 	}
 }
@@ -177,12 +339,21 @@ func listCommand(c *cli.Context) error {
 		return err
 	}
 
-	filter := tunnelstore.NewFilter()
+	warningChecker := updater.StartWarningCheck(c)
+	defer warningChecker.LogWarningIfAny(sc.log)
+
+	filter := cfapi.NewTunnelFilter()
 	if !c.Bool("show-deleted") {
 		filter.NoDeleted()
 	}
-	if name := c.String("name"); name != "" {
+	if name := c.String(flags.Name); name != "" {
 		filter.ByName(name)
+	}
+	if namePrefix := c.String("name-prefix"); namePrefix != "" {
+		filter.ByNamePrefix(namePrefix)
+	}
+	if excludePrefix := c.String("exclude-name-prefix"); excludePrefix != "" {
+		filter.ExcludeNameWithPrefix(excludePrefix)
 	}
 	if existedAt := c.Timestamp("time"); existedAt != nil {
 		filter.ByExistedAt(*existedAt)
@@ -194,10 +365,43 @@ func listCommand(c *cli.Context) error {
 		}
 		filter.ByTunnelID(tunnelID)
 	}
+	if maxFetch := c.Int("max-fetch-size"); maxFetch > 0 {
+		filter.MaxFetchSize(uint(maxFetch))
+	}
 
 	tunnels, err := sc.list(filter)
 	if err != nil {
 		return err
+	}
+
+	// Sort the tunnels
+	sortBy := c.String("sort-by")
+	invalidSortField := false
+	sort.Slice(tunnels, func(i, j int) bool {
+		cmp := func() bool {
+			switch sortBy {
+			case "name":
+				return tunnels[i].Name < tunnels[j].Name
+			case "id":
+				return tunnels[i].ID.String() < tunnels[j].ID.String()
+			case "createdAt":
+				return tunnels[i].CreatedAt.Unix() < tunnels[j].CreatedAt.Unix()
+			case "deletedAt":
+				return tunnels[i].DeletedAt.Unix() < tunnels[j].DeletedAt.Unix()
+			case "numConnections":
+				return len(tunnels[i].Connections) < len(tunnels[j].Connections)
+			default:
+				invalidSortField = true
+				return tunnels[i].Name < tunnels[j].Name
+			}
+		}()
+		if c.Bool("invert-sort") {
+			return !cmp
+		}
+		return cmp
+	})
+	if invalidSortField {
+		sc.log.Error().Msgf("%s is not a valid sort field. Valid sort fields are %s. Defaulting to 'name'.", sortBy, allSortByOptions)
 	}
 
 	if outputFormat := c.String(outputFormatFlag.Name); outputFormat != "" {
@@ -207,22 +411,17 @@ func listCommand(c *cli.Context) error {
 	if len(tunnels) > 0 {
 		formatAndPrintTunnelList(tunnels, c.Bool("show-recently-disconnected"))
 	} else {
-		fmt.Println("You have no tunnels, use 'cloudflared tunnel create' to define a new tunnel")
+		fmt.Println("No tunnels were found for the given filter flags. You can use 'cloudflared tunnel create' to create a tunnel.")
 	}
+
 	return nil
 }
 
-func formatAndPrintTunnelList(tunnels []*tunnelstore.Tunnel, showRecentlyDisconnected bool) {
-	const (
-		minWidth = 0
-		tabWidth = 8
-		padding  = 1
-		padChar  = ' '
-		flags    = 0
-	)
+func formatAndPrintTunnelList(tunnels []*cfapi.Tunnel, showRecentlyDisconnected bool) {
+	writer := tabWriter()
+	defer func() { _ = writer.Flush() }()
 
-	writer := tabwriter.NewWriter(os.Stdout, minWidth, tabWidth, padding, padChar, flags)
-	defer writer.Flush()
+	_, _ = fmt.Fprintln(writer, "You can obtain more detailed information for each tunnel with `cloudflared tunnel info <name/uuid>`")
 
 	// Print column headers with tabbed columns
 	_, _ = fmt.Fprintln(writer, "ID\tNAME\tCREATED\tCONNECTIONS\t")
@@ -240,17 +439,17 @@ func formatAndPrintTunnelList(tunnels []*tunnelstore.Tunnel, showRecentlyDisconn
 	}
 }
 
-func fmtConnections(connections []tunnelstore.Connection, showRecentlyDisconnected bool) string {
-
+func fmtConnections(connections []cfapi.Connection, showRecentlyDisconnected bool) string {
 	// Count connections per colo
 	numConnsPerColo := make(map[string]uint, len(connections))
-	for _, connection := range connections {
-		if !connection.IsPendingReconnect || showRecentlyDisconnected {
-			numConnsPerColo[connection.ColoName]++
+	for _, cfConnections := range connections {
+		if !cfConnections.IsPendingReconnect || showRecentlyDisconnected {
+			numConnsPerColo[cfConnections.ColoName]++
 		}
 	}
 
 	// Get sorted list of colos
+	// nolint: prealloc
 	sortedColos := []string{}
 	for coloName := range numConnsPerColo {
 		sortedColos = append(sortedColos, coloName)
@@ -258,21 +457,222 @@ func fmtConnections(connections []tunnelstore.Connection, showRecentlyDisconnect
 	sort.Strings(sortedColos)
 
 	// Map each colo to its frequency, combine into output string.
-	var output []string
+	output := make([]string, 0, len(sortedColos))
 	for _, coloName := range sortedColos {
 		output = append(output, fmt.Sprintf("%dx%s", numConnsPerColo[coloName], coloName))
 	}
 	return strings.Join(output, ", ")
 }
 
+func buildReadyCommand() *cli.Command {
+	return &cli.Command{
+		Name:               "ready",
+		Action:             cliutil.ConfiguredAction(readyCommand),
+		Usage:              "Call /ready endpoint and return proper exit code",
+		UsageText:          "cloudflared tunnel [tunnel command options] ready [subcommand options]",
+		Description:        "cloudflared tunnel ready will return proper exit code based on the /ready endpoint",
+		Flags:              []cli.Flag{},
+		CustomHelpTemplate: commandHelpTemplate(),
+	}
+}
+
+func readyCommand(c *cli.Context) error {
+	metricsOpts := c.String(flags.Metrics)
+	if !c.IsSet(flags.Metrics) {
+		return errors.New("--metrics has to be provided")
+	}
+
+	requestURL := fmt.Sprintf("http://%s/ready", metricsOpts)
+	req, err := http.NewRequest(http.MethodGet, requestURL, nil)
+	if err != nil {
+		return err
+	}
+	// nolint: gosec // URL is constructed from the user-configured local metrics endpoint.
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.StatusCode != 200 {
+		body, err := io.ReadAll(res.Body)
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("http://%s/ready endpoint returned status code %d\n%s", metricsOpts, res.StatusCode, body)
+	}
+	return nil
+}
+
+func buildInfoCommand() *cli.Command {
+	return &cli.Command{
+		Name:        "info",
+		Action:      cliutil.ConfiguredAction(tunnelInfo),
+		Usage:       "List details about the active connectors for a tunnel",
+		UsageText:   "cloudflared tunnel [tunnel command options] info [subcommand options] [TUNNEL]",
+		Description: "cloudflared tunnel info displays details about the active connectors for a given tunnel (identified by name or uuid).",
+		Flags: []cli.Flag{
+			outputFormatFlag,
+			showRecentlyDisconnected,
+			sortInfoByFlag,
+			invertInfoSortFlag,
+		},
+		CustomHelpTemplate: commandHelpTemplate(),
+	}
+}
+
+func tunnelInfo(c *cli.Context) error {
+	sc, err := newSubcommandContext(c)
+	if err != nil {
+		return err
+	}
+
+	warningChecker := updater.StartWarningCheck(c)
+	defer warningChecker.LogWarningIfAny(sc.log)
+
+	if c.NArg() != 1 {
+		return cliutil.UsageError(`"cloudflared tunnel info" accepts exactly one argument, the ID or name of the tunnel to get info about.`)
+	}
+	tunnelID, err := sc.findID(c.Args().First())
+	if err != nil {
+		return errors.Wrap(err, "error parsing tunnel ID")
+	}
+
+	client, err := sc.client()
+	if err != nil {
+		return err
+	}
+
+	clients, err := client.ListActiveClients(tunnelID)
+	if err != nil {
+		return err
+	}
+
+	sortBy := c.String("sort-by")
+	invalidSortField := false
+	sort.Slice(clients, func(i, j int) bool {
+		cmp := func() bool {
+			switch sortBy {
+			case "id":
+				return clients[i].ID.String() < clients[j].ID.String()
+			case "createdAt":
+				return clients[i].RunAt.Unix() < clients[j].RunAt.Unix()
+			case "numConnections":
+				return len(clients[i].Connections) < len(clients[j].Connections)
+			case "version":
+				return clients[i].Version < clients[j].Version
+			default:
+				invalidSortField = true
+				return clients[i].RunAt.Unix() < clients[j].RunAt.Unix()
+			}
+		}()
+		if c.Bool("invert-sort") {
+			return !cmp
+		}
+		return cmp
+	})
+	if invalidSortField {
+		sc.log.Error().Msgf("%s is not a valid sort field. Valid sort fields are %s. Defaulting to 'name'.", sortBy, connsSortByOptions)
+	}
+
+	tunnel, err := getTunnel(sc, tunnelID)
+	if err != nil {
+		return err
+	}
+	info := Info{
+		tunnel.ID,
+		tunnel.Name,
+		tunnel.CreatedAt,
+		clients,
+	}
+
+	if outputFormat := c.String(outputFormatFlag.Name); outputFormat != "" {
+		return renderOutput(outputFormat, info)
+	}
+
+	if len(clients) > 0 {
+		formatAndPrintConnectionsList(info, c.Bool("show-recently-disconnected"))
+	} else {
+		fmt.Printf("Your tunnel %s does not have any active connection.\n", tunnelID)
+	}
+
+	return nil
+}
+
+func getTunnel(sc *subcommandContext, tunnelID uuid.UUID) (*cfapi.Tunnel, error) {
+	filter := cfapi.NewTunnelFilter()
+	filter.ByTunnelID(tunnelID)
+	tunnels, err := sc.list(filter)
+	if err != nil {
+		return nil, err
+	}
+	if len(tunnels) != 1 {
+		return nil, errors.Errorf("Expected to find a single tunnel with uuid %v but found %d tunnels.", tunnelID, len(tunnels))
+	}
+	return tunnels[0], nil
+}
+
+func formatAndPrintConnectionsList(tunnelInfo Info, showRecentlyDisconnected bool) {
+	writer := tabWriter()
+	defer func() { _ = writer.Flush() }()
+
+	// Print the general tunnel info table
+	_, _ = fmt.Fprintf(writer, "NAME:     %s\nID:       %s\nCREATED:  %s\n\n", tunnelInfo.Name, tunnelInfo.ID, tunnelInfo.CreatedAt)
+
+	// Determine whether to print the connector table
+	shouldDisplayTable := false
+	for _, c := range tunnelInfo.Connectors {
+		conns := fmtConnections(c.Connections, showRecentlyDisconnected)
+		if len(conns) > 0 {
+			shouldDisplayTable = true
+		}
+	}
+	if !shouldDisplayTable {
+		fmt.Println("This tunnel has no active connectors.")
+		return
+	}
+
+	// Print the connector table
+	_, _ = fmt.Fprintln(writer, "CONNECTOR ID\tCREATED\tARCHITECTURE\tVERSION\tORIGIN IP\tEDGE\t")
+	for _, c := range tunnelInfo.Connectors {
+		conns := fmtConnections(c.Connections, showRecentlyDisconnected)
+		if len(conns) == 0 {
+			continue
+		}
+		originIp := c.Connections[0].OriginIP.String()
+		formattedStr := fmt.Sprintf(
+			"%s\t%s\t%s\t%s\t%s\t%s\t",
+			c.ID,
+			c.RunAt.Format(time.RFC3339),
+			c.Arch,
+			c.Version,
+			originIp,
+			conns,
+		)
+		_, _ = fmt.Fprintln(writer, formattedStr)
+	}
+}
+
+func tabWriter() *tabwriter.Writer {
+	const (
+		minWidth    = 0
+		tabWidth    = 8
+		padding     = 1
+		padChar     = ' '
+		formatFlags = 0
+	)
+
+	writer := tabwriter.NewWriter(os.Stdout, minWidth, tabWidth, padding, padChar, formatFlags)
+	return writer
+}
+
 func buildDeleteCommand() *cli.Command {
 	return &cli.Command{
 		Name:               "delete",
-		Action:             cliutil.ErrorHandler(deleteCommand),
+		Action:             cliutil.ConfiguredAction(deleteCommand),
 		Usage:              "Delete existing tunnel by UUID or name",
 		UsageText:          "cloudflared tunnel [tunnel command options] delete [subcommand options] TUNNEL",
 		Description:        "cloudflared tunnel delete will delete tunnels with the given tunnel UUIDs or names. A tunnel cannot be deleted if it has active connections. To delete the tunnel unconditionally, use -f flag.",
-		Flags:              []cli.Flag{credentialsFileFlag, forceDeleteFlag},
+		Flags:              []cli.Flag{credentialsFileFlagCLIOnly, forceDeleteFlag},
 		CustomHelpTemplate: commandHelpTemplate(),
 	}
 }
@@ -286,6 +686,9 @@ func deleteCommand(c *cli.Context) error {
 	if c.NArg() < 1 {
 		return cliutil.UsageError(`"cloudflared tunnel delete" requires at least 1 argument, the ID or name of the tunnel to delete.`)
 	}
+
+	warningChecker := updater.StartWarningCheck(c)
+	defer warningChecker.LogWarningIfAny(sc.log)
 
 	tunnelIDs, err := sc.findIDs(c.Args().Slice())
 	if err != nil {
@@ -309,19 +712,27 @@ func renderOutput(format string, v interface{}) error {
 }
 
 func buildRunCommand() *cli.Command {
-	flags := []cli.Flag{
-		forceFlag,
+	//nolint: prealloc
+	cliFlags := []cli.Flag{
 		credentialsFileFlag,
+		credentialsContentsFlag,
+		postQuantumFlag,
 		selectProtocolFlag,
+		featuresFlag,
+		tunnelTokenFlag,
+		tunnelTokenFileFlag,
+		icmpv4SrcFlag,
+		icmpv6SrcFlag,
+		maxActiveFlowsFlag,
+		dnsResolverAddrsFlag,
 	}
-	flags = append(flags, configureProxyFlags(false)...)
+	cliFlags = append(cliFlags, configureProxyFlags(false)...)
 	return &cli.Command{
 		Name:      "run",
-		Action:    cliutil.ErrorHandler(runCommand),
-		Before:    SetFlagsFromConfigFile,
+		Action:    cliutil.ConfiguredAction(runCommand),
 		Usage:     "Proxy a local web server by running the given tunnel",
 		UsageText: "cloudflared tunnel [tunnel command options] run [subcommand options] [TUNNEL]",
-		Description: `Runs the tunnel identified by name or UUUD, creating highly available connections
+		Description: `Runs the tunnel identified by name or UUID, creating highly available connections
   between your server and the Cloudflare edge. You can provide name or UUID of tunnel to run either as the
   last command line argument or in the configuration file using "tunnel: TUNNEL".
 
@@ -330,12 +741,16 @@ func buildRunCommand() *cli.Command {
   If you experience other problems running the tunnel, "cloudflared tunnel cleanup" may help by removing
   any old connection records.
 `,
-		Flags:              flags,
+		Flags:              cliFlags,
 		CustomHelpTemplate: commandHelpTemplate(),
 	}
 }
 
 func runCommand(c *cli.Context) error {
+	if err := rejectAllowedMailForNamedTunnel(c); err != nil {
+		return err
+	}
+
 	sc, err := newSubcommandContext(c)
 	if err != nil {
 		return err
@@ -344,16 +759,56 @@ func runCommand(c *cli.Context) error {
 	if c.NArg() > 1 {
 		return cliutil.UsageError(`"cloudflared tunnel run" accepts only one argument, the ID or name of the tunnel to run.`)
 	}
-	tunnelRef := c.Args().First()
-	if tunnelRef == "" {
-		// see if tunnel id was in the config file
-		tunnelRef = config.GetConfiguration().TunnelID
-		if tunnelRef == "" {
-			return cliutil.UsageError(`"cloudflared tunnel run" requires the ID or name of the tunnel to run as the last command line argument or in the configuration file.`)
-		}
+
+	if c.String("hostname") != "" {
+		sc.log.Warn().Msg("The property `hostname` in your configuration is ignored because you configured a Named Tunnel " +
+			"in the property `tunnel` to run. Make sure to provision the routing (e.g. via `cloudflared tunnel route dns/lb`) or else " +
+			"your origin will not be reachable. You should remove the `hostname` property to avoid this warning.")
 	}
 
-	return runNamedTunnel(sc, tunnelRef)
+	tokenStr := c.String(TunnelTokenFlag)
+	// Check if tokenStr is blank before checking for tokenFile
+	if tokenStr == "" {
+		if tokenFile := c.String(TunnelTokenFileFlag); tokenFile != "" {
+			// nolint: gosec
+			data, err := os.ReadFile(tokenFile)
+			if err != nil {
+				return cliutil.UsageError("Failed to read token file: %s", err.Error())
+			}
+			tokenStr = strings.TrimSpace(string(data))
+		}
+	}
+	// Check if token is provided and if not use default tunnelID flag method
+	if tokenStr != "" {
+		if token, err := ParseToken(tokenStr); err == nil {
+			return sc.runWithCredentials(token.Credentials())
+		}
+		return cliutil.UsageError("Provided Tunnel token is not valid.")
+	} else {
+		tunnelRef := c.Args().First()
+		if tunnelRef == "" {
+			// see if tunnel id was in the config file
+			tunnelRef = config.GetConfiguration().TunnelID
+			if tunnelRef == "" {
+				return cliutil.UsageError(`"cloudflared tunnel run" requires the ID or name of the tunnel to run as the last command line argument or in the configuration file.`)
+			}
+		}
+
+		return runNamedTunnel(sc, tunnelRef)
+	}
+}
+
+func ParseToken(tokenStr string) (*connection.TunnelToken, error) {
+	content, err := base64.StdEncoding.DecodeString(tokenStr)
+	if err != nil {
+		return nil, err
+	}
+
+	var token connection.TunnelToken
+	if err := json.Unmarshal(content, &token); err != nil {
+		return nil, err
+	}
+	return &token, nil
 }
 
 func runNamedTunnel(sc *subcommandContext, tunnelRef string) error {
@@ -361,19 +816,17 @@ func runNamedTunnel(sc *subcommandContext, tunnelRef string) error {
 	if err != nil {
 		return errors.Wrap(err, "error parsing tunnel ID")
 	}
-
-	sc.log.Info().Str(LogFieldTunnelID, tunnelID.String()).Msg("Starting tunnel")
-
 	return sc.run(tunnelID)
 }
 
 func buildCleanupCommand() *cli.Command {
 	return &cli.Command{
 		Name:               "cleanup",
-		Action:             cliutil.ErrorHandler(cleanupCommand),
+		Action:             cliutil.ConfiguredAction(cleanupCommand),
 		Usage:              "Cleanup tunnel connections",
 		UsageText:          "cloudflared tunnel [tunnel command options] cleanup [subcommand options] TUNNEL",
 		Description:        "Delete connections for tunnels with the given UUIDs or names.",
+		Flags:              []cli.Flag{cleanupClientFlag},
 		CustomHelpTemplate: commandHelpTemplate(),
 	}
 }
@@ -396,29 +849,105 @@ func cleanupCommand(c *cli.Context) error {
 	return sc.cleanupConnections(tunnelIDs)
 }
 
+func buildTokenCommand() *cli.Command {
+	return &cli.Command{
+		Name:               "token",
+		Action:             cliutil.ConfiguredAction(tokenCommand),
+		Usage:              "Fetch the credentials token for an existing tunnel (by name or UUID) that allows to run it",
+		UsageText:          "cloudflared tunnel [tunnel command options] token [subcommand options] TUNNEL",
+		Description:        "cloudflared tunnel token will fetch the credentials token for a given tunnel (by its name or UUID), which is then used to run the tunnel. This command fails if the tunnel does not exist or has been deleted. Use the flag `cloudflared tunnel token --cred-file /my/path/file.json TUNNEL` to output the token to the credentials JSON file. Note: this command only works for Tunnels created since cloudflared version 2022.3.0",
+		Flags:              []cli.Flag{credentialsFileFlagCLIOnly},
+		CustomHelpTemplate: commandHelpTemplate(),
+	}
+}
+
+func tokenCommand(c *cli.Context) error {
+	sc, err := newSubcommandContext(c)
+	if err != nil {
+		return errors.Wrap(err, "error setting up logger")
+	}
+
+	warningChecker := updater.StartWarningCheck(c)
+	defer warningChecker.LogWarningIfAny(sc.log)
+
+	if c.NArg() != 1 {
+		return cliutil.UsageError(`"cloudflared tunnel token" requires exactly 1 argument, the name or UUID of tunnel to fetch the credentials token for.`)
+	}
+	tunnelID, err := sc.findID(c.Args().First())
+	if err != nil {
+		return errors.Wrap(err, "error parsing tunnel ID")
+	}
+
+	token, err := sc.getTunnelTokenCredentials(tunnelID)
+	if err != nil {
+		return err
+	}
+
+	if path := c.String(CredFileFlag); path != "" {
+		credentials := token.Credentials()
+		err := writeTunnelCredentials(path, &credentials)
+		if err != nil {
+			return errors.Wrapf(err, "error writing token credentials to JSON file in path %s", path)
+		}
+
+		return nil
+	}
+
+	encodedToken, err := token.Encode()
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(encodedToken)
+	return nil
+}
+
 func buildRouteCommand() *cli.Command {
 	return &cli.Command{
 		Name:      "route",
-		Action:    cliutil.ErrorHandler(routeCommand),
-		Usage:     "Define what hostname or load balancer can route to this tunnel",
-		UsageText: "cloudflared tunnel [tunnel command options] route [subcommand options] dns|lb TUNNEL HOSTNAME [LB-POOL]",
-		Description: `The route defines what hostname or load balancer will proxy requests to this tunnel.
+		Usage:     "Define which traffic routed from Cloudflare edge to this tunnel: requests to a DNS hostname, to a Cloudflare Load Balancer, or traffic originating from Cloudflare WARP clients",
+		UsageText: "cloudflared tunnel [tunnel command options] route [subcommand options] [dns TUNNEL HOSTNAME]|[lb TUNNEL HOSTNAME LB-POOL]|[ip NETWORK TUNNEL]",
+		Description: `The route command defines how Cloudflare will proxy requests to this tunnel.
 
-   To route a hostname by creating a CNAME to tunnel's address:
-      cloudflared tunnel route dns <tunnel ID> <hostname>
-   To use this tunnel as a load balancer origin, creating pool and load balancer if necessary:
-      cloudflared tunnel route lb <tunnel ID> <load balancer name> <load balancer pool>`,
+To route a hostname by creating a DNS CNAME record to a tunnel:
+   cloudflared tunnel route dns <tunnel ID or name> <hostname>
+You can read more at: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/routing-to-tunnel/dns
+
+To use this tunnel as a load balancer origin, creating pool and load balancer if necessary:
+   cloudflared tunnel route lb <tunnel ID or name> <hostname> <load balancer pool>
+You can read more at: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/routing-to-tunnel/lb
+
+For Cloudflare WARP traffic to be routed to your private network, reachable from this tunnel as origins, use:
+   cloudflared tunnel route ip <network CIDR> <tunnel ID or name>
+Further information about managing Cloudflare WARP traffic to your tunnel is available at:
+   cloudflared tunnel route ip --help
+`,
 		CustomHelpTemplate: commandHelpTemplate(),
 		Subcommands: []*cli.Command{
+			{
+				Name:        "dns",
+				Action:      cliutil.ConfiguredAction(routeDnsCommand),
+				Usage:       "HostnameRoute a hostname by creating a DNS CNAME record to a tunnel",
+				UsageText:   "cloudflared tunnel route dns [TUNNEL] [HOSTNAME]",
+				Description: `Creates a DNS CNAME record hostname that points to the tunnel.`,
+				Flags:       []cli.Flag{overwriteDNSFlag},
+			},
+			{
+				Name:        "lb",
+				Action:      cliutil.ConfiguredAction(routeLbCommand),
+				Usage:       "Use this tunnel as a load balancer origin, creating pool and load balancer if necessary",
+				UsageText:   "cloudflared tunnel route lb [TUNNEL] [HOSTNAME] [LB-POOL-NAME]",
+				Description: `Creates Load Balancer with an origin pool that points to the tunnel.`,
+			},
 			buildRouteIPSubcommand(),
 		},
 	}
 }
 
-func dnsRouteFromArg(c *cli.Context) (tunnelstore.Route, error) {
+func dnsRouteFromArg(c *cli.Context, overwriteExisting bool) (cfapi.HostnameRoute, error) {
 	const (
-		userHostnameIndex = 2
-		expectedNArgs     = 3
+		userHostnameIndex = 1
+		expectedNArgs     = 2
 	)
 	if c.NArg() != expectedNArgs {
 		return nil, cliutil.UsageError("Expected %d arguments, got %d", expectedNArgs, c.NArg())
@@ -429,14 +958,14 @@ func dnsRouteFromArg(c *cli.Context) (tunnelstore.Route, error) {
 	} else if !validateHostname(userHostname, true) {
 		return nil, errors.Errorf("%s is not a valid hostname", userHostname)
 	}
-	return tunnelstore.NewDNSRoute(userHostname), nil
+	return cfapi.NewDNSRoute(userHostname, overwriteExisting), nil
 }
 
-func lbRouteFromArg(c *cli.Context) (tunnelstore.Route, error) {
+func lbRouteFromArg(c *cli.Context) (cfapi.HostnameRoute, error) {
 	const (
-		lbNameIndex   = 2
-		lbPoolIndex   = 3
-		expectedNArgs = 4
+		lbNameIndex   = 1
+		lbPoolIndex   = 2
+		expectedNArgs = 3
 	)
 	if c.NArg() != expectedNArgs {
 		return nil, cliutil.UsageError("Expected %d arguments, got %d", expectedNArgs, c.NArg())
@@ -455,11 +984,13 @@ func lbRouteFromArg(c *cli.Context) (tunnelstore.Route, error) {
 		return nil, errors.Errorf("%s is not a valid pool name", lbPool)
 	}
 
-	return tunnelstore.NewLBRoute(lbName, lbPool), nil
+	return cfapi.NewLBRoute(lbName, lbPool), nil
 }
 
-var nameRegex = regexp.MustCompile("^[_a-zA-Z0-9][-_.a-zA-Z0-9]*$")
-var hostNameRegex = regexp.MustCompile("^[*_a-zA-Z0-9][-_.a-zA-Z0-9]*$")
+var (
+	nameRegex     = regexp.MustCompile("^[_a-zA-Z0-9][-_.a-zA-Z0-9]*$")
+	hostNameRegex = regexp.MustCompile("^[*_a-zA-Z0-9][-_.a-zA-Z0-9]*$")
+)
 
 func validateName(s string, allowWildcardSubdomain bool) bool {
 	if allowWildcardSubdomain {
@@ -478,41 +1009,39 @@ func validateHostname(s string, allowWildcardSubdomain bool) bool {
 	return err == nil && validateName(puny, allowWildcardSubdomain)
 }
 
-func routeCommand(c *cli.Context) error {
-	if c.NArg() < 2 {
-		return cliutil.UsageError(`"cloudflared tunnel route" requires the first argument to be the route type(dns or lb), followed by the ID or name of the tunnel`)
+func routeDnsCommand(c *cli.Context) error {
+	if c.NArg() != 2 {
+		return cliutil.UsageError(`This command expects the format "cloudflared tunnel route dns <tunnel name/id> <hostname>"`)
 	}
+	return routeCommand(c, "dns")
+}
+
+func routeLbCommand(c *cli.Context) error {
+	if c.NArg() != 3 {
+		return cliutil.UsageError(`This command expects the format "cloudflared tunnel route lb <tunnel name/id> <hostname> <load balancer pool>"`)
+	}
+	return routeCommand(c, "lb")
+}
+
+func routeCommand(c *cli.Context, routeType string) error {
 	sc, err := newSubcommandContext(c)
 	if err != nil {
 		return err
 	}
 
-	const tunnelIDIndex = 1
-
-	routeType := c.Args().First()
-	var route tunnelstore.Route
-	var tunnelID uuid.UUID
+	tunnelID, err := sc.findID(c.Args().Get(0))
+	if err != nil {
+		return err
+	}
+	var route cfapi.HostnameRoute
 	switch routeType {
 	case "dns":
-		tunnelID, err = sc.findID(c.Args().Get(tunnelIDIndex))
-		if err != nil {
-			return err
-		}
-		route, err = dnsRouteFromArg(c)
-		if err != nil {
-			return err
-		}
+		route, err = dnsRouteFromArg(c, c.Bool(overwriteDNSFlagName))
 	case "lb":
-		tunnelID, err = sc.findID(c.Args().Get(tunnelIDIndex))
-		if err != nil {
-			return err
-		}
 		route, err = lbRouteFromArg(c)
-		if err != nil {
-			return err
-		}
-	default:
-		return cliutil.UsageError("%s is not a recognized route type. Supported route types are dns and lb", routeType)
+	}
+	if err != nil {
+		return err
 	}
 
 	res, err := sc.route(tunnelID, route)
@@ -529,7 +1058,7 @@ func commandHelpTemplate() string {
 	for _, f := range configureCloudflaredFlags(false) {
 		parentFlagsHelp += fmt.Sprintf(" %s\n\t", f)
 	}
-	for _, f := range configureLoggingFlags(false) {
+	for _, f := range cliutil.ConfigureLoggingFlags(false) {
 		parentFlagsHelp += fmt.Sprintf(" %s\n\t", f)
 	}
 	const template = `NAME:
@@ -548,4 +1077,80 @@ SUBCOMMAND OPTIONS:
 	{{end}}
 `
 	return fmt.Sprintf(template, parentFlagsHelp)
+}
+
+func buildDiagCommand() *cli.Command {
+	return &cli.Command{
+		Name:        "diag",
+		Action:      cliutil.ConfiguredAction(diagCommand),
+		Usage:       "Creates a diagnostic report from a local cloudflared instance",
+		UsageText:   "cloudflared tunnel [tunnel command options] diag [subcommand options]",
+		Description: "cloudflared tunnel diag will create a diagnostic report of a local cloudflared instance. The diagnostic procedure collects: logs, metrics, system information, traceroute to Cloudflare Edge, and runtime information. Since there may be multiple instances of cloudflared running the --metrics option may be provided to target a specific instance.",
+		Flags: []cli.Flag{
+			metricsFlag,
+			diagContainerFlag,
+			diagPodFlag,
+			noDiagLogsFlag,
+			noDiagMetricsFlag,
+			noDiagSystemFlag,
+			noDiagRuntimeFlag,
+			noDiagNetworkFlag,
+		},
+		CustomHelpTemplate: commandHelpTemplate(),
+	}
+}
+
+func diagCommand(ctx *cli.Context) error {
+	sctx, err := newSubcommandContext(ctx)
+	if err != nil {
+		return err
+	}
+	log := sctx.log
+	options := diagnostic.Options{
+		KnownAddresses: metrics.GetMetricsKnownAddresses(metrics.Runtime),
+		Address:        sctx.c.String(flags.Metrics),
+		ContainerID:    sctx.c.String(diagContainerIDFlagName),
+		PodID:          sctx.c.String(diagPodFlagName),
+		Region:         sctx.c.String(flags.Region),
+		Toggles: diagnostic.Toggles{
+			NoDiagLogs:    sctx.c.Bool(noDiagLogsFlagName),
+			NoDiagMetrics: sctx.c.Bool(noDiagMetricsFlagName),
+			NoDiagSystem:  sctx.c.Bool(noDiagSystemFlagName),
+			NoDiagRuntime: sctx.c.Bool(noDiagRuntimeFlagName),
+			NoDiagNetwork: sctx.c.Bool(noDiagNetworkFlagName),
+		},
+	}
+
+	if options.Address == "" {
+		log.Info().Msg("If your instance is running in a Docker/Kubernetes environment you need to setup port forwarding for your application.")
+	}
+
+	states, err := diagnostic.RunDiagnostic(log, options)
+
+	if errors.Is(err, diagnostic.ErrMetricsServerNotFound) {
+		log.Warn().Msg("No instances found")
+		return nil
+	}
+	if errors.Is(err, diagnostic.ErrMultipleMetricsServerFound) {
+		if states != nil {
+			log.Info().Msgf("Found multiple instances running:")
+			for _, state := range states {
+				log.Info().Msgf("Instance: tunnel-id=%s connector-id=%s metrics-address=%s", state.TunnelID, state.ConnectorID, state.URL.String())
+			}
+			log.Info().Msgf("To select one instance use the option --metrics")
+		}
+		return nil
+	}
+
+	if errors.Is(err, diagnostic.ErrLogConfigurationIsInvalid) {
+		log.Info().Msg("Couldn't extract logs from the instance. If the instance is running in a containerized environment use the option --diag-container-id or --diag-pod-id. If there is no logging configuration use --no-diag-logs.")
+	}
+
+	if err != nil {
+		log.Warn().Msg("Diagnostic completed with one or more errors")
+	} else {
+		log.Info().Msg("Diagnostic completed")
+	}
+
+	return nil
 }

@@ -2,7 +2,7 @@ package socks
 
 import (
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"testing"
@@ -32,7 +32,7 @@ func sendSocksRequest(t *testing.T) []byte {
 	assert.NoError(t, err)
 	defer resp.Body.Close()
 
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	assert.NoError(t, err)
 
 	return b
@@ -40,9 +40,9 @@ func sendSocksRequest(t *testing.T) []byte {
 
 func startTestServer(t *testing.T, httpHandler func(w http.ResponseWriter, r *http.Request)) {
 	// create a socks server
-	requestHandler := NewRequestHandler(NewNetDialer())
+	requestHandler := NewRequestHandler(NewNetDialer(), nil)
 	socksServer := NewConnectionHandler(requestHandler)
-	listener, err := net.Listen("tcp", ":8086")
+	listener, err := net.Listen("tcp", "localhost:8086")
 	assert.NoError(t, err)
 
 	go func() {
@@ -58,7 +58,7 @@ func startTestServer(t *testing.T, httpHandler func(w http.ResponseWriter, r *ht
 	mux.HandleFunc("/", httpHandler)
 
 	// start the servers
-	go http.ListenAndServe(":8085", mux)
+	go http.ListenAndServe("localhost:8085", mux)
 }
 
 func respondWithJSON(w http.ResponseWriter, v interface{}, status int) {
